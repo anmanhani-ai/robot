@@ -57,6 +57,17 @@ void CommandHandler::processCommand(String command) {
         Serial.print("SPEED:");
         Serial.println(dualMotor.getSpeed());
     }
+    // X-Axis alignment commands (ใช้สำหรับ align_to_target)
+    else if (command == "MOVE_X:FW") {
+        // เลื่อนไปทางขวา (forward ในแกน X ของกล้อง)
+        dualMotor.curveRight();
+        sendDone();
+    }
+    else if (command == "MOVE_X:BW") {
+        // เลื่อนไปทางซ้าย (backward ในแกน X ของกล้อง)
+        dualMotor.curveLeft();
+        sendDone();
+    }
     
     // ==================== ARM Z COMMANDS (Time-based) ====================
     else if (command.startsWith("ACT:Z_OUT:")) {
