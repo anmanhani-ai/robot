@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Node.js
+node_modules/
+npm-debug.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Local config
+.env
+.env.local
+
+# YOLO models (too large for git)
+*.pt
+*.onnx
+*.engine
+
+# Data files
+*.csv
+report.json
+status.json
+
+# Compiled frontend (regeneratable)
+PI_WEBAPP/frontend/dist/
+
+# Raspberry Pi specific
+*.mp4
+*.jpg
+*.png
+!*.example.png
+
+# Gemini artifacts
+.gemini/

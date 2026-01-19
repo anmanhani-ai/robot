@@ -1,0 +1,22 @@
+{
+  "img_width": 640,
+  "img_height": 480,
+  "camera_angle_deg": 45.0,
+  "camera_height_cm": 50.0,
+  "pixel_to_cm_z": 0.037219168261048784,
+  "pixel_to_cm_z_near": 0.02444987775061125,
+  "pixel_to_cm_z_center": 0.039840321263446846,
+  "pixel_to_cm_z_far": 0.047367305769088264,
+  "arm_speed_cm_per_sec": 10.0,
+  "arm_base_offset_cm": 5.0,
+  "max_arm_extend_cm": 50.0,
+  "pixel_to_cm_x": 0.037219168261048784,
+  "wheel_speed_cm_per_sec": 20.0,
+  "alignment_tolerance_px": 30,
+  "default_spray_duration": 1.0,
+  "encoder_ppr": 20,
+  "wheel_diameter_mm": 30.0,
+  "calibrated_at": "2026-01-14T15:44:14.571870",
+  "calibrated_by": "Easy Guided Calibration",
+  "notes": ""
+}
