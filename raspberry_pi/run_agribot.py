@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+"""
+AgriBot Main Runner - ฉบับสมบูรณ์
+Entry point หลักที่มี Flow การทำงานถูกต้องตามที่ออกแบบ
+
+Flow:
+1. รถเดินหน้า + ตรวจจับ
+2. พบวัชพืช → หยุด
+3. คำนวณ + เคลื่อนที่ให้วัตถุอยู่บนแกน Y ของภาพ
+4. คำนวณระยะยืดแขน Z
+5. ชดเชยระยะ กล้อง→แขน (8.5cm)
+6. ยืด Z → ลง Y → ฉีด 3 วิ
+7. ขึ้น Y → หด Z → reset
+8. เดินหน้าต่อ
+
+Author: AgriBot Team
+"""
+
+import argparse
+import logging
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+from robot_brain import RobotBrain, CalibrationConfig, RobotState
+from weed_detector import WeedDetector, Detection
+from exceptions import RobotConnectionError, CameraError, EmergencyStopError
+
+# Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('agribot.log', encoding='utf-8')
+    ]
+)
+logger = logging.getLogger(__name__)
+
+
+class AgribotController:
+    """
+    Main Controller รวม RobotBrain + WeedDetector
+    จัดการ Flow การทำงานทั้งหมด
+    """
+    
+    # Constants
+    IMAGE_CENTER_X = 320  # กลางภาพ 640px (แกน Y ของภาพ)
+    IMAGE_CENTER_Y = 240  # กลางภาพ 480px (แกน X ของภาพ)
+    SPRAY_DURATION = 3.0  # เวลาฉีดพ่น (วินาที)
+    
+    def __init__(self, config: CalibrationConfig = None):
+        self.config = config or CalibrationConfig.load_from_file()
+        self.brain = RobotBrain(self.config)
+        self.detector = WeedDetector(
+            frame_width=self.config.img_width,
+            frame_height=self.config.img_height,
+            confidence_threshold=0.25
+        )
+        self.running = False
+    
+    def connect(self) -> bool:
+        """เชื่อมต่อ ESP32 และ กล้อง"""
+        if not self.detector.start_camera():
+            raise CameraError(self.detector.camera_id, "Failed to start camera")
+        
+        if not self.brain.connect():
+            self.detector.stop_camera()
+            raise RobotConnectionError(port=self.config.serial_port)
+        
+        logger.info("✅ All systems connected")
+        return True
+    
+    def disconnect(self):
+        """ปิดการเชื่อมต่อ"""
+        self.brain.stop_movement()
+        self.brain.disconnect()
+        self.detector.stop_camera()
+        logger.info("🔌 Disconnected")
+    
+    def is_valid_target(self, detection: Detection) -> bool:
+        """
+        ตรวจสอบว่า target ยังไม่ถูกประมวลผล
+        
+        กฎ: วัตถุที่อยู่ "หลัง" แกน X ของภาพ (Y > CENTER_Y)
+             = อยู่หลังรถแล้ว = ไม่ทำซ้ำ
+        
+        แก้ไข: เนื่องจากกล้องหันซ้าย
+        - Y ในภาพ = ตำแหน่งไกล-ใกล้จากรถ (สำหรับแกน Z)
+        - X ในภาพ = ตำแหน่งหน้า-หลังของรถ
+        
+        วัตถุที่ X < CENTER_X = อยู่หลังรถ (ผ่านมาแล้ว)
+        """
+        # X ในภาพ < กลาง = อยู่ซ้ายภาพ = อยู่หลังรถ
+        return detection.x >= self.IMAGE_CENTER_X
+    
+    def calculate_align_movement(self, detection: Detection) -> tuple:
+        """
+        คำนวณระยะที่ต้องเดินหน้า/ถอยหลัง ให้วัตถุอยู่บนแกน Y ของภาพ
+        
+        Args:
+            detection: วัตถุที่ตรวจพบ
+            
+        Returns:
+            tuple: (direction 'FW'/'BW', time_seconds)
+        """
+        # offset จากกลางภาพ (แกน Y)
+        offset_x_px = detection.x - self.IMAGE_CENTER_X
+        
+        # แปลงเป็น cm
+        offset_cm = abs(offset_x_px) * self.config.pixel_to_cm_x
+        
+        # คำนวณเวลา
+        time_seconds = offset_cm / self.config.wheel_speed_cm_per_sec
+        
+        # ทิศทาง: X+ ในภาพ = อยู่หน้ารถ = ต้องเดินหน้า
+        direction = "FW" if offset_x_px > 0 else "BW"
+        
+        logger.info(f"📏 Align: {offset_x_px}px = {offset_cm:.1f}cm = {direction} {time_seconds:.2f}s")
+        
+        return direction, time_seconds
+    
+    def calculate_z_extension(self, detection: Detection) -> float:
+        """
+        คำนวณเวลายืดแขน Z จากตำแหน่ง Y ในภาพ
+        
+        Y ในภาพ = ระยะไกล-ใกล้จากตัวรถ
+        - Y = 0 (บนภาพ) = ไกลจากรถ = ยืดมาก
+        - Y = 480 (ล่างภาพ) = ใกล้รถ = ยืดน้อย
+        
+        Returns:
+            float: เวลายืดแขน (วินาที)
+        """
+        # ระยะจากขอบล่างภาพ (= ระยะจากรถ)
+        distance_from_bottom_px = self.config.img_height - detection.y
+        
+        # แปลงเป็น cm
+        z_distance_cm = distance_from_bottom_px * self.config.pixel_to_cm_z
+        
+        # คำนวณเวลา
+        z_time = z_distance_cm / self.config.arm_speed_cm_per_sec
+        
+        # Safety limit
+        z_time = min(z_time, self.config.max_arm_extend_time)
+        
+        logger.info(f"📏 Z extension: {distance_from_bottom_px}px = {z_distance_cm:.1f}cm = {z_time:.2f}s")
+        
+        return z_time
+    
+    def compensate_camera_offset(self):
+        """
+        เดินหน้าชดเชยระยะ กล้อง → แขน (8.5 cm)
+        """
+        offset_cm = self.config.arm_base_offset_cm  # 8.5 cm
+        offset_time = offset_cm / self.config.wheel_speed_cm_per_sec
+        
+        logger.info(f"📏 Camera offset: {offset_cm}cm = {offset_time:.2f}s forward")
+        
+        self.brain.move_forward()
+        time.sleep(offset_time)
+        self.brain.stop_movement()
+    
+    def execute_spray_sequence(self, z_time: float):
+        """
+        ปฏิบัติการฉีดพ่น
+        
+        1. ยืดแขน Z
+        2. ลงแขน Y
+        3. ฉีด 3 วินาที
+        4. ขึ้นแขน Y
+        5. หดแขน Z
+        """
+        logger.info("🎯 Starting spray sequence...")
+        
+        # Step 1: ยืดแขน Z
+        logger.info(f"   Z OUT: {z_time:.2f}s")
+        self.brain.extend_arm(z_time)
+        
+        # Step 2: ลงแขน Y
+        logger.info("   Y DOWN")
+        self.brain.lower_spray_head()
+        
+        # Step 3: ฉีดพ่น
+        logger.info(f"   SPRAY: {self.SPRAY_DURATION}s")
+        self.brain.spray(self.SPRAY_DURATION)
+        
+        # Step 4: ขึ้นแขน Y
+        logger.info("   Y UP")
+        self.brain.raise_spray_head()
+        
+        # Step 5: หดแขน Z (บวก buffer)
+        retract_time = z_time + self.config.arm_retract_buffer
+        logger.info(f"   Z IN: {retract_time:.2f}s")
+        self.brain.retract_arm(z_time)
+        
+        logger.info("✅ Spray sequence complete")
+    
+    def process_target(self, detection: Detection):
+        """
+        ประมวลผล target ที่ตรวจพบ (Flow เต็ม)
+        """
+        logger.info(f"🌿 Processing target: {detection.class_name} at ({detection.x}, {detection.y})")
+        
+        # STEP 2-3: คำนวณและเคลื่อนที่ให้วัตถุอยู่บนแกน Y
+        direction, align_time = self.calculate_align_movement(detection)
+        
+        if align_time > 0.05:  # มากกว่า 50ms ถึงจะเคลื่อนที่
+            if direction == "FW":
+                self.brain.move_forward()
+            else:
+                self.brain.move_backward()
+            time.sleep(align_time)
+            self.brain.stop_movement()
+        
+        # STEP 4: คำนวณระยะยืดแขน Z
+        z_time = self.calculate_z_extension(detection)
+        
+        # STEP 5: ชดเชยระยะ กล้อง → แขน
+        self.compensate_camera_offset()
+        
+        # STEP 6-7: ปฏิบัติการฉีดพ่น + reset
+        self.execute_spray_sequence(z_time)
+    
+    def run_auto_mode(self):
+        """
+        โหมดอัตโนมัติ - Loop หลัก
+        """
+        logger.info("🚀 Starting AUTO mode")
+        self.running = True
+        
+        try:
+            while self.running:
+                # STEP 0: เดินหน้า
+                self.brain.move_forward()
+                
+                while self.running:
+                    # จับภาพ
+                    frame = self.detector.capture_frame()
+                    if frame is None:
+                        continue
+                    
+                    # ตรวจจับ
+                    detections = self.detector.detect(frame)
+                    
+                    # กรองเฉพาะ target ที่ valid (อยู่หน้ารถ)
+                    valid_targets = [d for d in detections 
+                                    if d.is_target and self.is_valid_target(d)]
+                    
+                    if valid_targets:
+                        # STEP 1: หยุดรถ
+                        self.brain.stop_movement()
+                        
+                        # เลือก target ที่ใกล้กลางที่สุด
+                        target = min(valid_targets, 
+                                    key=lambda d: abs(d.x - self.IMAGE_CENTER_X))
+                        
+                        # ประมวลผล
+                        self.process_target(target)
+                        
+                        # STEP 8: เดินหน้าต่อ (break inner loop)
+                        break
+                    
+                    time.sleep(0.05)  # 20 FPS
+                    
+        except KeyboardInterrupt:
+            logger.info("🛑 Stopped by user (Ctrl+C)")
+        except EmergencyStopError:
+            logger.warning("⚠️ Emergency stop activated!")
+        finally:
+            self.running = False
+            self.brain.stop_movement()
+    
+    def run_test_mode(self):
+        """ทดสอบการเชื่อมต่อ"""
+        print("\n" + "="*50)
+        print("  Connection Test")
+        print("="*50)
+        
+        # Test ESP32
+        print("\n🔌 Testing ESP32...")
+        if self.brain.connect():
+            print("   ✅ ESP32 OK")
+            self.brain.disconnect()
+        else:
+            print("   ❌ ESP32 FAILED")
+            return False
+        
+        # Test Camera
+        print("\n📷 Testing Camera...")
+        if self.detector.start_camera():
+            frame = self.detector.capture_frame()
+            if frame is not None:
+                print(f"   ✅ Camera OK ({frame.shape[1]}x{frame.shape[0]})")
+                self.detector.stop_camera()
+            else:
+                print("   ❌ Camera read FAILED")
+                self.detector.stop_camera()
+                return False
+        else:
+            print("   ❌ Camera open FAILED")
+            return False
+        
+        print("\n" + "="*50)
+        print("  ✅ All systems ready!")
+        print("="*50)
+        return True
+
+
+def main():
+    parser = argparse.ArgumentParser(description='AgriBot Controller')
+    parser.add_argument('--test', action='store_true', help='Test connections')
+    parser.add_argument('--debug', action='store_true', help='Debug mode')
+    args = parser.parse_args()
+    
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+    
+    print("="*50)
+    print("  🚜 AgriBot - Weed Spraying Robot")
+    print("  Version 3.0.0")
+    print("="*50)
+    
+    controller = AgribotController()
+    
+    if args.test:
+        success = controller.run_test_mode()
+        sys.exit(0 if success else 1)
+    
+    try:
+        controller.connect()
+        controller.run_auto_mode()
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        sys.exit(1)
+    finally:
+        controller.disconnect()
+
+
+if __name__ == "__main__":
+    main()

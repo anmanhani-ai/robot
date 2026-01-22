@@ -1,0 +1,15 @@
+# AgriBot Dependencies
+# Install: pip install -r requirements.txt
+
+# Serial Communication
+pyserial>=3.5
+
+# Computer Vision
+opencv-python>=4.10.0
+numpy>=1.26.0
+
+# YOLO11/YOLO26 Detection (required)
+ultralytics>=8.3.0
+
+# Camera (for Raspberry Pi)
+# picamera2  # Uncomment if using Pi Camera

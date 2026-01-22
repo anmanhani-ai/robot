@@ -1,0 +1,11 @@
+{
+  "weed_count": 0,
+  "chili_count": 0,
+  "distance_traveled": 0.0,
+  "state": "Idle",
+  "spray_count": 0,
+  "battery": 100,
+  "timestamp": "2026-01-22T02:48:24.680957",
+  "robot_message": "สวัสดีครับ! พร้อมทำงานแล้ว 🌱",
+  "robot_emoji": "😊"
+}

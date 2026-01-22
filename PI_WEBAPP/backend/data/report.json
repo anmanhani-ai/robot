@@ -1,0 +1,37 @@
+[
+  {
+    "timestamp": "2026-01-22T02:42:03.204232",
+    "event": "MISSION_START",
+    "x": null,
+    "y": null,
+    "details": "Mission started (Continuous)"
+  },
+  {
+    "timestamp": "2026-01-22T02:43:22.958278",
+    "event": "TARGET_SPRAYED",
+    "x": 504.0,
+    "y": 37.0,
+    "details": "Spray #1 - kite"
+  },
+  {
+    "timestamp": "2026-01-22T02:44:00.600289",
+    "event": "MANUAL_STOP",
+    "x": null,
+    "y": null,
+    "details": "Emergency stop via manual control"
+  },
+  {
+    "timestamp": "2026-01-22T02:44:50.551233",
+    "event": "MISSION_START",
+    "x": null,
+    "y": null,
+    "details": "Mission started (Continuous)"
+  },
+  {
+    "timestamp": "2026-01-22T02:47:20.147725",
+    "event": "MANUAL_STOP",
+    "x": null,
+    "y": null,
+    "details": "Emergency stop via manual control"
+  }
+]
