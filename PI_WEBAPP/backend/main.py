@@ -51,6 +51,9 @@ class RobotStatus(BaseModel):
     # Friendly message for UX
     robot_message: str = "สวัสดีครับ! พร้อมทำงานแล้ว 🌱"
     robot_emoji: str = "😊"
+    # Current step tracking for debugging
+    current_step: int = 0  # 0=Idle, 1=Searching, 2-3=Aligning, 4=Calculate Z, 5=Offset, 6=Spraying, 7=Reset
+    step_description: str = ""  # รายละเอียด step ปัจจุบัน
 
 class LogEntry(BaseModel):
     timestamp: str
@@ -217,6 +220,26 @@ class RealRobotController:
         
         self._save_status()
     
+    def set_step(self, step: int, description: str):
+        """
+        อัพเดท step ปัจจุบันสำหรับแสดงบน Web Dashboard
+        
+        Steps:
+        0 = Idle
+        1 = Searching (เดินหน้า+ตรวจจับ)
+        2 = Target Detected (พบวัชพืช หยุดรถ)
+        3 = Aligning (เคลื่อนที่ให้วัตถุอยู่แกน Y)
+        4 = Calculate Z (คำนวณระยะยืดแขน)
+        5 = Compensate Offset (ชดเชย 8.5cm)
+        6 = Spraying (ยืด Z → ลง Y → ฉีด)
+        7 = Reset (ขึ้น Y → หด Z)
+        8 = Continue (เดินหน้าต่อ)
+        """
+        self.status.current_step = step
+        self.status.step_description = description
+        print(f"📍 STEP {step}: {description}")
+        self._save_status()
+    
     def start_mission(self, single_shot: bool = False) -> dict:
         """เริ่ม Mission"""
         if not self.esp32_connected or not self.camera_connected:
@@ -289,192 +312,170 @@ class RealRobotController:
     
     def _auto_mode_loop(self, single_shot: bool = False):
         """
-        Auto mode loop - STOP-CALCULATE-MOVE LOGIC
+        Auto mode loop - ใช้ Flow ที่ออกแบบใหม่
         
         Flow:
-        1. เดินหน้าไปเรื่อยๆ จนกว่าจะพบเป้าหมาย
-        2. เจอเป้าหมาย → หยุดทันที! รอ 3 วินาที
-        3. คำนวณระยะจาก pixel ไปยังตรงกลาง → แปลงเป็นเวลา
-        4. เดินหน้าตามเวลาที่คำนวณ จนวัตถุอยู่ตรงกลาง
-        5. หยุด → ทำ Spray sequence
-        6. เสร็จ → หาวัตถุต่อไป
+        0. เดินหน้า + ตรวจจับ
+        1. พบวัชพืช → หยุด
+        2-3. Align ให้วัตถุอยู่บนแกน Y
+        4. คำนวณระยะยืดแขน Z
+        5. ชดเชย offset กล้อง-แขน (8.5cm)
+        6. ยืด Z → ลง Y → ฉีด
+        7. ขึ้น Y → หด Z → reset
+        8. เดินหน้าต่อ
         """
         if not self.brain or not self.detector:
             print("❌ Brain or Detector not available")
             return
         
-        print("🚀 Auto mode started (NEW COORDINATE SYSTEM)")
+        print("🚀 Auto mode started (NEW FLOW)")
         
-        # ================================================
-        # COORDINATE SYSTEM:
-        # - Origin (0,0) at BOTTOM CENTER of image (pixel 320, 480)
-        # - X-axis: left = backward (X-), right = forward (X+)
-        # - Y-axis: only POSITIVE, goes UP from origin
-        # - X = target_pixel_x - 320
-        # - Y = 480 - target_pixel_y (always positive)
-        # ================================================
-        
-        # Calibration constants
-        PIXEL_TO_CM = 0.05  # 1 pixel = 0.05 cm
-        WHEEL_SPEED_CM_PER_SEC = 5.0  # ความเร็วล้อ cm/s (ปรับได้)
-        IMG_WIDTH = 640
-        IMG_HEIGHT = 480
-        IMG_CENTER_X = IMG_WIDTH // 2  # 320
-        DETECTION_WAIT = 3.0  # หยุดรอ 3 วินาทีหลังเจอ
-        
-        # Spray sequence timings (seconds)
-        MOVE_FORWARD_BEFORE = 4.0
-        Y_DOWN_DURATION = 4.5
+        # ใช้ค่าจาก config
+        IMG_CENTER_X = self.config.img_center_x if self.config else 320
         SPRAY_DURATION = 3.0
-        Y_UP_DURATION = 5.0
-        MOVE_FORWARD_AFTER = 4.0
         
-        # Start moving forward
-        self.brain.move_forward_speed(self.brain.SPEED_NORMAL)
-        self.status.state = "Searching"
+        self.set_step(0, "เริ่มต้นระบบ")
         
         while self.is_running:
             try:
-                # Step 1: Capture & detect
-                frame = self.detector.capture_frame()
-                if frame is None:
-                    time.sleep(0.05)
-                    continue
-                
-                all_detections = self.detector.detect(frame)
-                target = self.detector.get_nearest_target(all_detections)
-                
-                if target is None:
-                    # No target - keep moving and searching
-                    if self.status.state != "Searching":
-                        self.status.state = "Searching"
-                        self.brain.move_forward_speed(self.brain.SPEED_NORMAL)
-                        print("👁️ No target - searching...")
-                    time.sleep(0.1)
-                    continue
-                
                 # ================================================
-                # STEP 2: TARGET DETECTED! CONVERT TO NEW COORDINATES
+                # STEP 1: เดินหน้า + ตรวจจับ
                 # ================================================
-                # Convert pixel coordinates to new system
-                # X = target.x - 320 (center is 0)
-                # Y = 480 - target.y (bottom is 0, always positive)
-                coord_x = target.x - IMG_CENTER_X  # X+ = right = forward
-                coord_y = IMG_HEIGHT - target.y    # Y+ = up (always positive)
+                self.set_step(1, "กำลังเดินหน้าและตรวจจับวัชพืช")
+                self.brain.move_forward()
                 
-                print(f"🎯 TARGET DETECTED: {target.class_name}")
-                print(f"   Pixel: ({target.x}, {target.y})")
-                print(f"   Coord: (X={coord_x}, Y={coord_y})")
-                
-                # STOP robot immediately
-                self.brain.stop_movement()
-                self.status.state = "Target Detected"
-                self._save_status()
-                
-                print(f"🛑 STOPPED! Waiting {DETECTION_WAIT} seconds...")
-                time.sleep(DETECTION_WAIT)
-                
-                # ================================================
-                # STEP 3: RE-CAPTURE AND CALCULATE DISTANCE
-                # ================================================
-                frame = self.detector.capture_frame()
-                if frame:
+                target_found = False
+                while self.is_running and not target_found:
+                    frame = self.detector.capture_frame()
+                    if frame is None:
+                        time.sleep(0.05)
+                        continue
+                    
                     all_detections = self.detector.detect(frame)
-                    target = self.detector.get_nearest_target(all_detections)
-                
-                if target is None:
-                    print("❌ Lost target after wait - resuming search")
-                    self.brain.move_forward_speed(self.brain.SPEED_NORMAL)
-                    self.status.state = "Searching"
-                    continue
-                
-                # Recalculate coordinates
-                coord_x = target.x - IMG_CENTER_X
-                
-                # ================================================
-                # STEP 3.5: CALCULATE Y (from bottom edge of image to bottom edge of object)
-                # ================================================
-                # target.y = center of object, target.h = height of object
-                target_bottom_y = target.y + (target.h // 2)  # bottom edge of object in pixel
-                pixels_from_bottom = IMG_HEIGHT - target_bottom_y  # distance from bottom edge of image
-                y_distance_cm = pixels_from_bottom * PIXEL_TO_CM  # convert to cm (1px = 0.05cm)
-                y_approach_time = y_distance_cm / 2.17  # use speed 2.17 cm/s as specified
-                
-                print(f"📏 CALCULATING:")
-                print(f"   Target X from center: {coord_x}px")
-                print(f"   Target bottom Y (pixel): {target_bottom_y}px")
-                print(f"   Pixels from bottom edge: {pixels_from_bottom}px")
-                print(f"   Y distance: {y_distance_cm:.2f}cm")
-                print(f"   Y approach time: {y_approach_time:.2f}s (at 2.17 cm/s)")
-                
-                # Calculate X movement time
-                distance_cm_x = coord_x * PIXEL_TO_CM
-                move_time = abs(distance_cm_x) / WHEEL_SPEED_CM_PER_SEC
-                print(f"   X distance: {distance_cm_x:.2f}cm, move time: {move_time:.2f}s")
-                
-                # ================================================
-                # STEP 4: SLOWLY MOVE TO CENTER THE TARGET (X = 0)
-                # ================================================
-                if move_time > 0.1:
-                    self.status.state = "Centering"
-                    self._save_status()
                     
-                    if coord_x > 0:
-                        # X+ means target is to the right = need to move FORWARD slowly
-                        print(f"🐢 Slowly moving FORWARD for {move_time:.2f}s to center (X={coord_x})")
-                        self.brain.move_forward_speed(self.brain.SPEED_SLOW)  # Slow speed
-                        time.sleep(move_time)
-                        self.brain.stop_movement()
+                    # กรองเฉพาะ target ที่อยู่หน้ารถ (X >= CENTER)
+                    valid_targets = [d for d in all_detections 
+                                    if d.is_target and d.x >= IMG_CENTER_X]
+                    
+                    if valid_targets:
+                        target = min(valid_targets, key=lambda d: abs(d.x - IMG_CENTER_X))
+                        target_found = True
                     else:
-                        # X- means target is to the left = need to move BACKWARD slowly
-                        print(f"🐢 Slowly moving BACKWARD for {move_time:.2f}s to center (X={coord_x})")
-                        self.brain.send_cmd("DRIVE_BW")
-                        time.sleep(move_time)
-                        self.brain.send_cmd("DRIVE_STOP")
+                        time.sleep(0.1)
+                
+                if not self.is_running:
+                    break
+                
+                # ================================================
+                # STEP 2: พบวัชพืช → หยุดรถ
+                # ================================================
+                self.set_step(2, f"พบ {target.class_name}! หยุดรถ")
+                self.brain.stop_movement()
+                self.status.weed_count += 1
+                
+                # Log detection
+                append_log(LogEntry(
+                    timestamp=datetime.now().isoformat(),
+                    event="TARGET_DETECTED",
+                    x=target.x,
+                    y=target.y,
+                    details=f"Detected: {target.class_name}"
+                ))
+                
+                time.sleep(0.5)  # brief pause
+                
+                # ================================================
+                # STEP 3: Align ให้วัตถุอยู่บนแกน Y
+                # ================================================
+                try:
+                    print(f">>> STEP 3: Calculating align for target.x={target.x}")
+                    direction, align_time = self.brain.calculate_align_to_y_axis(target.x)
+                    self.set_step(3, f"Align: {direction} {align_time:.2f}s")
+                    print(f">>> STEP 3: direction={direction}, align_time={align_time:.2f}s")
                     
-                    print("🛑 Stopped! Target should now be centered (X ≈ 0)")
-                    time.sleep(0.5)
+                    if align_time > 0.05:
+                        if direction == "FW":
+                            print(f">>> STEP 3: Moving forward {align_time:.2f}s")
+                            self.brain.move_forward_time(align_time)
+                        else:
+                            print(f">>> STEP 3: Moving backward {align_time:.2f}s")
+                            self.brain.move_backward_time(align_time)
+                    print(">>> STEP 3: Done")
+                except Exception as e:
+                    print(f"❌ STEP 3 Error: {e}")
+                    import traceback
+                    traceback.print_exc()
                 
                 # ================================================
-                # STEP 5: EXECUTE SPRAY SEQUENCE
+                # STEP 4: คำนวณระยะยืดแขน Z
                 # ================================================
-                self.status.state = "Spraying"
-                self._save_status()
-                print("🚀 Starting spray sequence...")
-                
-                # 5.1: Move forward 4 seconds
-                print(f"   [1/5] Moving forward {MOVE_FORWARD_BEFORE}s...")
-                self.brain.send_cmd("DRIVE_FW")
-                time.sleep(MOVE_FORWARD_BEFORE)
-                self.brain.send_cmd("DRIVE_STOP")
-                
-                # 5.2: Y-axis down 4.5 seconds
-                print(f"   [2/5] Y-axis down {Y_DOWN_DURATION}s...")
-                self.brain.send_cmd(f"ACT:Y_DOWN:{Y_DOWN_DURATION}")
-                time.sleep(Y_DOWN_DURATION + 0.5)
-                
-                # 5.3: Spray 3 seconds
-                print(f"   [3/5] Spraying {SPRAY_DURATION}s...")
-                self.brain.send_cmd(f"ACT:SPRAY:{SPRAY_DURATION}")
-                time.sleep(SPRAY_DURATION + 0.5)
-                
-                # 5.4: Y-axis up 5 seconds
-                print(f"   [4/5] Y-axis up {Y_UP_DURATION}s...")
-                self.brain.send_cmd(f"ACT:Y_UP:{Y_UP_DURATION}")
-                time.sleep(Y_UP_DURATION + 0.5)
-                
-                # 5.5: Move forward 4 seconds
-                print(f"   [5/5] Moving forward {MOVE_FORWARD_AFTER}s...")
-                self.brain.send_cmd("DRIVE_FW")
-                time.sleep(MOVE_FORWARD_AFTER)
-                self.brain.send_cmd("DRIVE_STOP")
+                try:
+                    print(f">>> STEP 4: Calculating Z for target.y={target.y}")
+                    z_distance_cm, z_time = self.brain.calculate_z_from_image_y(target.y)
+                    self.set_step(4, f"คำนวณ Z: {z_distance_cm:.1f}cm = {z_time:.2f}s")
+                    print(f">>> STEP 4: z_distance={z_distance_cm:.1f}cm, z_time={z_time:.2f}s")
+                except Exception as e:
+                    print(f"❌ STEP 4 Error: {e}")
+                    z_distance_cm, z_time = 5.0, 2.3  # fallback
                 
                 # ================================================
-                # STEP 6: SPRAY COMPLETED!
+                # STEP 5: ชดเชย offset กล้อง → แขน (8.5cm)
                 # ================================================
+                try:
+                    print(">>> STEP 5: Getting camera offset time")
+                    offset_time = self.brain.get_camera_offset_time()
+                    self.set_step(5, f"ชดเชย offset: เดินหน้า {offset_time:.2f}s")
+                    print(f">>> STEP 5: offset_time={offset_time:.2f}s")
+                    self.brain.move_forward_time(offset_time)
+                    print(">>> STEP 5: Done")
+                except Exception as e:
+                    print(f"❌ STEP 5 Error: {e}")
+                    import traceback
+                    traceback.print_exc()
+                
+                # ================================================
+                # STEP 6: ปฏิบัติการฉีดพ่น
+                # ================================================
+                try:
+                    print(f">>> STEP 6: Extending arm for {z_time:.2f}s")
+                    self.set_step(6, "ยืดแขน Z...")
+                    self.brain.extend_arm(z_time)
+                    
+                    print(">>> STEP 6: Lowering spray head")
+                    self.set_step(6, "ลงแขน Y...")
+                    self.brain.lower_spray_head()
+                    
+                    print(f">>> STEP 6: Spraying for {SPRAY_DURATION}s")
+                    self.set_step(6, f"กำลังฉีดพ่น {SPRAY_DURATION}s...")
+                    self.brain.spray(SPRAY_DURATION)
+                    print(">>> STEP 6: Done")
+                except Exception as e:
+                    print(f"❌ STEP 6 Error: {e}")
+                    import traceback
+                    traceback.print_exc()
+                
+                # ================================================
+                # STEP 7: Reset - กลับสู่ตำแหน่งเดิม
+                # ================================================
+                try:
+                    print(">>> STEP 7: Raising spray head")
+                    self.set_step(7, "ขึ้นแขน Y...")
+                    self.brain.raise_spray_head()
+                    
+                    print(f">>> STEP 7: Retracting arm for {z_time:.2f}s")
+                    self.set_step(7, "หดแขน Z...")
+                    self.brain.retract_arm(z_time)
+                    print(">>> STEP 7: Done")
+                except Exception as e:
+                    print(f"❌ STEP 7 Error: {e}")
+                    import traceback
+                    traceback.print_exc()
+                
+                # Update spray count
                 self.status.spray_count += 1
-                print(f"✅ Spray #{self.status.spray_count} completed!")
+                print(f">>> Spray count: {self.status.spray_count}")
                 
+                # Log completion
                 append_log(LogEntry(
                     timestamp=datetime.now().isoformat(),
                     event="TARGET_SPRAYED",
@@ -483,30 +484,30 @@ class RealRobotController:
                     details=f"Spray #{self.status.spray_count} - {target.class_name}"
                 ))
                 
-                # Check if single shot mode
+                # Single shot mode?
                 if single_shot:
-                    print("🛑 Single shot mode - stopping mission")
-                    self.status.state = "Completed"
-                    self._save_status()
-                    self._auto_running = False
-                    self._stop_event.set()
+                    self.set_step(8, "Single Shot - เสร็จสิ้น")
+                    self.is_running = False
                     break
                 
-                # Resume searching for next target
-                print("🔄 Resuming search for next target...")
-                self.status.state = "Searching"
-                self.brain.move_forward_speed(self.brain.SPEED_NORMAL)
-                time.sleep(1.0)  # Brief pause
+                # ================================================
+                # STEP 8: เดินหน้าต่อ
+                # ================================================
+                self.set_step(8, "เสร็จสิ้น! กำลังหาเป้าหมายถัดไป...")
+                print(">>> STEP 8: Continuing to next target")
+                time.sleep(1.0)
                 
             except Exception as e:
                 print(f"❌ Auto mode error: {e}")
                 import traceback
                 traceback.print_exc()
-                time.sleep(0.1)
+                self.set_step(0, f"Error: {str(e)}")
+                time.sleep(0.5)
         
         # Stopped
-        print("🛑 Auto mode stopped")
+        self.set_step(0, "หยุดทำงาน")
         self.brain.stop_movement()
+        print("🛑 Auto mode stopped")
     
     def get_status(self) -> dict:
         """ดึง status ปัจจุบัน"""

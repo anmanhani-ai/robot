@@ -86,8 +86,8 @@ class CalibrationConfig:
     motor_y_max_cm: float = 20.0            # ระยะเคลื่อนที่ Y สูงสุด (cm)
     
     # === X-Axis Calibration (ล้อ) ===
-    wheel_speed_cm_per_sec: float = 20.0    # ความเร็วล้อ (cm/s)  
-    pixel_to_cm_x: float = 0.1              # 1 pixel = กี่ cm (แกน X)
+    wheel_speed_cm_per_sec: float = 2.17    # ความเร็วล้อ (cm/s) - จาก calibration  
+    pixel_to_cm_x: float = 0.05             # 1 pixel = กี่ cm (แกน X)
     alignment_tolerance_px: int = 30        # ค่าคลาดเคลื่อน align (pixel)
     
     # === Spray Configuration ===
@@ -318,10 +318,10 @@ class RobotBrain:
         
         return time_seconds, actual_distance
     
-    # ==================== NEW COORDINATE SYSTEM ====================
-    # Origin (0,0) at bottom center (pixel 320, 480)
-    # X-axis: left(-) ← 0 → right(+) = robot direction
-    # Y-axis: 0 → up(+) only (no negative Y)
+    # ==================== CAMERA COORDINATE SYSTEM ====================
+    # กล้องหันไปทางซ้ายของรถ
+    # X ในภาพ = หน้า-หลังของรถ (X+ = หน้ารถ)
+    # Y ในภาพ = ระยะไกล-ใกล้จากรถ (ใช้คำนวณ Z-axis)
     # ================================================================
     
     def calculate_coord_x_movement(self, coord_x: int) -> Tuple[str, float]:
@@ -380,6 +380,107 @@ class RobotBrain:
     def is_aligned(self, distance_from_center_px: int) -> bool:
         """ตรวจสอบว่า target อยู่ตรงกลางแล้วหรือยัง"""
         return abs(distance_from_center_px) <= self.config.alignment_tolerance_px
+    
+    # ==================== FLOW METHODS (ตาม Flow ที่ออกแบบ) ====================
+    
+    def calculate_align_to_y_axis(self, target_x: int) -> Tuple[str, float]:
+        """
+        STEP 2-3: คำนวณการเคลื่อนที่ให้วัตถุอยู่บนแกน Y ของภาพ
+        
+        Args:
+            target_x: ตำแหน่ง X ของวัตถุในภาพ (0-640)
+            
+        Returns:
+            Tuple[str, float]: (direction 'FW'/'BW', time_seconds)
+            
+        Note:
+            - X ในภาพ = หน้า-หลังของรถ (เพราะกล้องหันซ้าย)
+            - X > center (320) = วัตถุอยู่หน้ารถ = ต้องเดินหน้า
+            - X < center (320) = วัตถุอยู่หลังรถ = ต้องถอยหลัง
+        """
+        center_x = self.config.img_center_x  # 320
+        offset_px = target_x - center_x
+        
+        direction = "FW" if offset_px > 0 else "BW"
+        distance_cm = abs(offset_px) * self.config.pixel_to_cm_x
+        time_seconds = distance_cm / self.config.wheel_speed_cm_per_sec
+        
+        logger.info(f"📏 Align to Y-axis: {target_x}px - {center_x}px = {offset_px}px")
+        logger.info(f"   → {direction} {distance_cm:.1f}cm = {time_seconds:.2f}s")
+        
+        return direction, time_seconds
+    
+    def calculate_z_from_image_y(self, target_y: int) -> Tuple[float, float]:
+        """
+        STEP 4: คำนวณระยะยืดแขน Z จากตำแหน่ง Y ในภาพ
+        
+        Args:
+            target_y: ตำแหน่ง Y ของวัตถุในภาพ (0-480)
+            
+        Returns:
+            Tuple[float, float]: (z_distance_cm, z_time_seconds)
+            
+        Note:
+            - Y ในภาพ = ระยะไกล-ใกล้จากรถ (กล้องหันซ้าย)
+            - Y = 0 (บนภาพ) = ไกลจากรถ = ยืดแขนมาก
+            - Y = 480 (ล่างภาพ) = ใกล้รถ = ยืดแขนน้อย
+        """
+        # ระยะจากขอบล่างภาพ = ระยะที่ต้องยืดแขน
+        distance_from_bottom_px = self.config.img_height - target_y
+        
+        z_distance_cm = distance_from_bottom_px * self.config.pixel_to_cm_z
+        z_time = z_distance_cm / self.config.arm_speed_cm_per_sec
+        
+        # Safety limit
+        z_time = min(z_time, self.config.max_arm_extend_time)
+        
+        logger.info(f"📏 Z extension: Y={target_y}px → {distance_from_bottom_px}px from bottom")
+        logger.info(f"   → {z_distance_cm:.1f}cm = {z_time:.2f}s")
+        
+        return z_distance_cm, z_time
+    
+    def get_camera_offset_time(self) -> float:
+        """
+        STEP 5: คำนวณเวลาที่ต้องเดินหน้าเพื่อชดเชยระยะ กล้อง → แขน
+        
+        Returns:
+            float: เวลาที่ต้องเดินหน้า (วินาที)
+        """
+        offset_cm = self.config.arm_base_offset_cm  # 8.5 cm
+        offset_time = offset_cm / self.config.wheel_speed_cm_per_sec
+        
+        logger.info(f"📏 Camera offset: {offset_cm}cm = {offset_time:.2f}s")
+        
+        return offset_time
+    
+    def move_forward_time(self, time_seconds: float) -> bool:
+        """เดินหน้าตามเวลาที่กำหนด แล้วหยุด"""
+        if time_seconds <= 0:
+            return True
+        self.move_forward()
+        time.sleep(time_seconds)
+        return self.stop_movement()
+    
+    def move_backward_time(self, time_seconds: float) -> bool:
+        """ถอยหลังตามเวลาที่กำหนด แล้วหยุด"""
+        if time_seconds <= 0:
+            return True
+        self.move_backward()
+        time.sleep(time_seconds)
+        return self.stop_movement()
+    
+    def is_target_behind_robot(self, target_x: int) -> bool:
+        """
+        ตรวจสอบว่าวัตถุอยู่หลังรถแล้วหรือยัง (ไม่ต้องทำซ้ำ)
+        
+        Args:
+            target_x: ตำแหน่ง X ของวัตถุในภาพ
+            
+        Returns:
+            bool: True ถ้าอยู่หลังรถแล้ว
+        """
+        # X < center = อยู่ซ้ายภาพ = อยู่หลังรถ (เพราะกล้องหันซ้าย)
+        return target_x < self.config.img_center_x
     
     # ==================== ARM OPERATIONS ====================
     

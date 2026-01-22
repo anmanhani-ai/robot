@@ -83,84 +83,10 @@ class AgribotController:
     def is_valid_target(self, detection: Detection) -> bool:
         """
         ตรวจสอบว่า target ยังไม่ถูกประมวลผล
-        
-        กฎ: วัตถุที่อยู่ "หลัง" แกน X ของภาพ (Y > CENTER_Y)
-             = อยู่หลังรถแล้ว = ไม่ทำซ้ำ
-        
-        แก้ไข: เนื่องจากกล้องหันซ้าย
-        - Y ในภาพ = ตำแหน่งไกล-ใกล้จากรถ (สำหรับแกน Z)
-        - X ในภาพ = ตำแหน่งหน้า-หลังของรถ
-        
-        วัตถุที่ X < CENTER_X = อยู่หลังรถ (ผ่านมาแล้ว)
+        ใช้ method จาก RobotBrain
         """
-        # X ในภาพ < กลาง = อยู่ซ้ายภาพ = อยู่หลังรถ
-        return detection.x >= self.IMAGE_CENTER_X
-    
-    def calculate_align_movement(self, detection: Detection) -> tuple:
-        """
-        คำนวณระยะที่ต้องเดินหน้า/ถอยหลัง ให้วัตถุอยู่บนแกน Y ของภาพ
-        
-        Args:
-            detection: วัตถุที่ตรวจพบ
-            
-        Returns:
-            tuple: (direction 'FW'/'BW', time_seconds)
-        """
-        # offset จากกลางภาพ (แกน Y)
-        offset_x_px = detection.x - self.IMAGE_CENTER_X
-        
-        # แปลงเป็น cm
-        offset_cm = abs(offset_x_px) * self.config.pixel_to_cm_x
-        
-        # คำนวณเวลา
-        time_seconds = offset_cm / self.config.wheel_speed_cm_per_sec
-        
-        # ทิศทาง: X+ ในภาพ = อยู่หน้ารถ = ต้องเดินหน้า
-        direction = "FW" if offset_x_px > 0 else "BW"
-        
-        logger.info(f"📏 Align: {offset_x_px}px = {offset_cm:.1f}cm = {direction} {time_seconds:.2f}s")
-        
-        return direction, time_seconds
-    
-    def calculate_z_extension(self, detection: Detection) -> float:
-        """
-        คำนวณเวลายืดแขน Z จากตำแหน่ง Y ในภาพ
-        
-        Y ในภาพ = ระยะไกล-ใกล้จากตัวรถ
-        - Y = 0 (บนภาพ) = ไกลจากรถ = ยืดมาก
-        - Y = 480 (ล่างภาพ) = ใกล้รถ = ยืดน้อย
-        
-        Returns:
-            float: เวลายืดแขน (วินาที)
-        """
-        # ระยะจากขอบล่างภาพ (= ระยะจากรถ)
-        distance_from_bottom_px = self.config.img_height - detection.y
-        
-        # แปลงเป็น cm
-        z_distance_cm = distance_from_bottom_px * self.config.pixel_to_cm_z
-        
-        # คำนวณเวลา
-        z_time = z_distance_cm / self.config.arm_speed_cm_per_sec
-        
-        # Safety limit
-        z_time = min(z_time, self.config.max_arm_extend_time)
-        
-        logger.info(f"📏 Z extension: {distance_from_bottom_px}px = {z_distance_cm:.1f}cm = {z_time:.2f}s")
-        
-        return z_time
-    
-    def compensate_camera_offset(self):
-        """
-        เดินหน้าชดเชยระยะ กล้อง → แขน (8.5 cm)
-        """
-        offset_cm = self.config.arm_base_offset_cm  # 8.5 cm
-        offset_time = offset_cm / self.config.wheel_speed_cm_per_sec
-        
-        logger.info(f"📏 Camera offset: {offset_cm}cm = {offset_time:.2f}s forward")
-        
-        self.brain.move_forward()
-        time.sleep(offset_time)
-        self.brain.stop_movement()
+        # วัตถุที่อยู่หลังรถแล้ว = ไม่ทำซ้ำ
+        return not self.brain.is_target_behind_robot(detection.x)
     
     def execute_spray_sequence(self, z_time: float):
         """
@@ -200,25 +126,25 @@ class AgribotController:
     def process_target(self, detection: Detection):
         """
         ประมวลผล target ที่ตรวจพบ (Flow เต็ม)
+        ใช้ methods จาก RobotBrain
         """
         logger.info(f"🌿 Processing target: {detection.class_name} at ({detection.x}, {detection.y})")
         
         # STEP 2-3: คำนวณและเคลื่อนที่ให้วัตถุอยู่บนแกน Y
-        direction, align_time = self.calculate_align_movement(detection)
+        direction, align_time = self.brain.calculate_align_to_y_axis(detection.x)
         
         if align_time > 0.05:  # มากกว่า 50ms ถึงจะเคลื่อนที่
             if direction == "FW":
-                self.brain.move_forward()
+                self.brain.move_forward_time(align_time)
             else:
-                self.brain.move_backward()
-            time.sleep(align_time)
-            self.brain.stop_movement()
+                self.brain.move_backward_time(align_time)
         
-        # STEP 4: คำนวณระยะยืดแขน Z
-        z_time = self.calculate_z_extension(detection)
+        # STEP 4: คำนวณระยะยืดแขน Z จาก Y ในภาพ
+        z_distance_cm, z_time = self.brain.calculate_z_from_image_y(detection.y)
         
-        # STEP 5: ชดเชยระยะ กล้อง → แขน
-        self.compensate_camera_offset()
+        # STEP 5: ชดเชยระยะ กล้อง → แขน (8.5 cm)
+        offset_time = self.brain.get_camera_offset_time()
+        self.brain.move_forward_time(offset_time)
         
         # STEP 6-7: ปฏิบัติการฉีดพ่น + reset
         self.execute_spray_sequence(z_time)

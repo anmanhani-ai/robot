@@ -19,6 +19,7 @@ import GpioConfigPage from './components/GpioConfigPage';
 import AutoTestPage from './components/AutoTestPage';
 import ModelSelectorPage from './components/ModelSelectorPage';
 import CalibrationPage from './components/CalibrationPage';
+import StepIndicator from './components/StepIndicator';
 
 // API
 import { getStatus, sendCommand, getLogs, downloadReport, resetReport, CAMERA_STREAM_URL } from './services/api';
@@ -36,6 +37,8 @@ export default function App() {
     state: 'Idle',
     spray_count: 0,
     battery: 100,
+    current_step: 0,
+    step_description: '',
   });
   const [logs, setLogs] = useState([]);
   const [isConnected, setIsConnected] = useState(false);
@@ -301,6 +304,14 @@ export default function App() {
 
               {/* State Indicator */}
               <StateIndicator state={status.state} />
+
+              {/* Step Indicator - แสดง step ปัจจุบัน */}
+              {(status.current_step > 0 || status.step_description) && (
+                <StepIndicator
+                  currentStep={status.current_step}
+                  stepDescription={status.step_description}
+                />
+              )}
 
               {/* Robot Speech Bubble */}
               <div className="bg-gradient-to-r from-primary-500/10 to-blue-500/10 
