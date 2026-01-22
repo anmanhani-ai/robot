@@ -12,6 +12,7 @@
   "pixel_to_cm_z_far": 0.05,
   "arm_speed_cm_per_sec": 2.17,
   "arm_base_offset_cm": 8.5,
+  "z_base_offset_cm": 7.0,
   "max_arm_extend_cm": 16.3,
   "pixel_to_cm_x": 0.05,
   "wheel_speed_cm_per_sec": 2.17,

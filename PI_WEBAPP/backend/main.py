@@ -334,18 +334,31 @@ class RealRobotController:
         IMG_CENTER_X = self.config.img_center_x if self.config else 320
         SPRAY_DURATION = 3.0
         
+        # ป้องกันการ re-detect ระหว่าง processing
+        is_processing = False
+        last_target_x = None
+        last_target_y = None
+        MIN_TARGET_DISTANCE = 50  # pixels - ระยะห่างขั้นต่ำที่ถือว่าเป็น target ใหม่
+        
         self.set_step(0, "เริ่มต้นระบบ")
         
         while self.is_running:
             try:
                 # ================================================
-                # STEP 1: เดินหน้า + ตรวจจับ
+                # STEP 1: เดินหน้า + ตรวจจับ (เฉพาะเมื่อไม่ได้ processing)
                 # ================================================
+                if is_processing:
+                    print("⚠️ Still processing, skip detection")
+                    time.sleep(0.1)
+                    continue
+                
                 self.set_step(1, "กำลังเดินหน้าและตรวจจับวัชพืช")
                 self.brain.move_forward()
                 
                 target_found = False
-                while self.is_running and not target_found:
+                target = None
+                
+                while self.is_running and not target_found and not is_processing:
                     frame = self.detector.capture_frame()
                     if frame is None:
                         time.sleep(0.05)
@@ -357,14 +370,33 @@ class RealRobotController:
                     valid_targets = [d for d in all_detections 
                                     if d.is_target and d.x >= IMG_CENTER_X]
                     
+                    # กรองออก target ที่เพิ่งทำไปแล้ว (ระยะใกล้กว่า MIN_TARGET_DISTANCE)
+                    if last_target_x is not None and last_target_y is not None:
+                        valid_targets = [
+                            d for d in valid_targets 
+                            if abs(d.x - last_target_x) > MIN_TARGET_DISTANCE or 
+                               abs(d.y - last_target_y) > MIN_TARGET_DISTANCE
+                        ]
+                    
                     if valid_targets:
                         target = min(valid_targets, key=lambda d: abs(d.x - IMG_CENTER_X))
                         target_found = True
+                        # ตั้ง flag processing ทันที!
+                        is_processing = True
+                        print(f"🎯 Target found at ({target.x}, {target.y}) - LOCKING")
                     else:
                         time.sleep(0.1)
                 
                 if not self.is_running:
                     break
+                
+                if target is None:
+                    is_processing = False
+                    continue
+                
+                # บันทึกตำแหน่ง target ปัจจุบัน
+                last_target_x = target.x
+                last_target_y = target.y
                 
                 # ================================================
                 # STEP 2: พบวัชพืช → หยุดรถ
@@ -495,6 +527,10 @@ class RealRobotController:
                 # ================================================
                 self.set_step(8, "เสร็จสิ้น! กำลังหาเป้าหมายถัดไป...")
                 print(">>> STEP 8: Continuing to next target")
+                
+                # ปลดล็อค detection สำหรับ target ถัดไป
+                is_processing = False
+                print(">>> Processing UNLOCKED - ready for next target")
                 time.sleep(1.0)
                 
             except Exception as e:
@@ -502,6 +538,7 @@ class RealRobotController:
                 import traceback
                 traceback.print_exc()
                 self.set_step(0, f"Error: {str(e)}")
+                is_processing = False  # ปลดล็อคกรณี error
                 time.sleep(0.5)
         
         # Stopped

@@ -76,6 +76,7 @@ class CalibrationConfig:
     arm_speed_cm_per_sec: float = 10.0      # ความเร็วแขน Z (cm/s)
     pixel_to_cm_z: float = 0.05             # 1 pixel = กี่ cm (แกน Z)
     arm_base_offset_cm: float = 5.0         # ระยะจากแกนกลางถึงจุดเริ่มยืดแขน
+    z_base_offset_cm: float = 7.0           # ระยะขอบล่างภาพถึงขอบซ้ายรถ (cm)
     max_arm_extend_time: float = 5.0        # เวลาสูงสุดที่ยืดได้ (วินาที)
     arm_retract_buffer: float = 0.5         # เวลาเพิ่มเติมตอนหด (วินาที)
     arm_z_default_cm: float = 0.0           # ตำแหน่ง default Z (cm)
@@ -424,18 +425,24 @@ class RobotBrain:
             - Y ในภาพ = ระยะไกล-ใกล้จากรถ (กล้องหันซ้าย)
             - Y = 0 (บนภาพ) = ไกลจากรถ = ยืดแขนมาก
             - Y = 480 (ล่างภาพ) = ใกล้รถ = ยืดแขนน้อย
+            - ขอบล่างภาพห่างจากขอบซ้ายรถ 7cm (z_base_offset_cm)
         """
-        # ระยะจากขอบล่างภาพ = ระยะที่ต้องยืดแขน
+        # ระยะจากขอบล่างภาพ (pixel)
         distance_from_bottom_px = self.config.img_height - target_y
         
-        z_distance_cm = distance_from_bottom_px * self.config.pixel_to_cm_z
+        # แปลงเป็น cm + เพิ่ม offset ขอบล่างภาพถึงขอบรถ
+        z_from_image_cm = distance_from_bottom_px * self.config.pixel_to_cm_z
+        z_base_offset = getattr(self.config, 'z_base_offset_cm', 7.0)
+        z_distance_cm = z_from_image_cm + z_base_offset
+        
         z_time = z_distance_cm / self.config.arm_speed_cm_per_sec
         
         # Safety limit
         z_time = min(z_time, self.config.max_arm_extend_time)
         
         logger.info(f"📏 Z extension: Y={target_y}px → {distance_from_bottom_px}px from bottom")
-        logger.info(f"   → {z_distance_cm:.1f}cm = {z_time:.2f}s")
+        logger.info(f"   → image={z_from_image_cm:.1f}cm + offset={z_base_offset:.1f}cm = {z_distance_cm:.1f}cm")
+        logger.info(f"   → time={z_time:.2f}s")
         
         return z_distance_cm, z_time
     
