@@ -26,6 +26,7 @@
  */
 
 #include "config.h"
+#include "gpio_config.h"
 #include "encoder.h"
 #include "motor_z.h"
 #include "motor_y.h"
@@ -43,6 +44,9 @@ bool isRunning = false;
 
 // ==================== SETUP ====================
 void setup() {
+    // Initialize GPIO config first (loads from EEPROM)
+    gpioConfig.init();
+    
     // Initialize all modules
     cmdHandler.init();
     encoderZ.init();        // Encoder ก่อน Motor Z

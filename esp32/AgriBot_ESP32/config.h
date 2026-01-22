@@ -9,9 +9,9 @@
 // ==================== PIN CONFIGURATION ====================
 
 // Motor DC สำหรับแกน Z (ยืด/หด แขนกล)
-// Driver แบบ 4 ขา - ใช้ PWM ผ่าน IN1/IN2 โดยตรง
-#define PIN_MOTOR_Z_IN1   26    // PWM Forward
-#define PIN_MOTOR_Z_IN2   27    // PWM Backward
+// Driver แบบ 4 ขา - ใช้ PWM ผ่าน IN3/IN4
+#define PIN_MOTOR_Z_IN3   26    // PWM Forward
+#define PIN_MOTOR_Z_IN4   27    // PWM Backward
 
 // Motor DC สำหรับแกน Y (ขึ้น/ลง หัวฉีด)
 // ใช้แทน Servo

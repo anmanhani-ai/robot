@@ -9,8 +9,8 @@
 // ==================== PIN CONFIGURATION ====================
 
 // Motor DC สำหรับแกน Z (ยืด/หด แขนกล)
-#define PIN_MOTOR_Z_IN1   26    // Motor Driver IN1
-#define PIN_MOTOR_Z_IN2   27    // Motor Driver IN2
+#define PIN_MOTOR_Z_IN3   26    // Motor Driver IN3
+#define PIN_MOTOR_Z_IN4   27    // Motor Driver IN4
 #define PIN_MOTOR_Z_PWM   14    // PWM Speed Control (0-255)
 
 // Servo สำหรับแกน Y (ยก/วาง หัวฉีด)

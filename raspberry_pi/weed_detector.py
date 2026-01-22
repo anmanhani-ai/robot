@@ -93,39 +93,73 @@ class PlantClass(Enum):
 
 @dataclass
 class Detection:
-    """ข้อมูลการตรวจจับวัตถุ"""
+    """
+    ข้อมูลการตรวจจับวัตถุ
+    
+    ระบบพิกัดใหม่:
+    - Origin (0,0) อยู่ที่กลางล่างของภาพ (pixel 320, 480)
+    - X-axis: ซ้าย(-) ← 0 → ขวา(+) = ทิศทางรถ
+    - Y-axis: 0 → บน(+) เท่านั้น (ไม่มี Y ติดลบ)
+    - coord_x = x - 320 (center of image)
+    - coord_y = 480 - y (from bottom of image, always positive)
+    """
     x: int                  # พิกัด X ของจุดกลาง (pixel)
     y: int                  # พิกัด Y ของจุดกลาง (pixel)
     width: int              # ความกว้าง bounding box
-    height: int             # ความสูง bounding box
+    height: int             # ความสูง bounding box (h)
     confidence: float       # ความมั่นใจ (0-1)
     class_name: str         # ชื่อ class เช่น "weed", "chili"
     class_id: int           # ID ของ class
     is_target: bool         # True = ต้องพ่นยา (เฉพาะหญ้า)
     
-    # ระยะทางจากแกนกลาง (สำหรับแกน Z)
-    distance_from_center_x: int = 0  # pixel
-    distance_from_center_y: int = 0  # pixel
+    # ระยะทางจากแกนกลาง (legacy - สำหรับ compatibility)
+    distance_from_center_x: int = 0  # pixel (x - center_x)
+    distance_from_center_y: int = 0  # pixel (y - center_y)
+    
+    # ==================== NEW COORDINATE SYSTEM ====================
+    @property
+    def coord_x(self) -> int:
+        """
+        X ในระบบพิกัดใหม่ (origin ที่กลางล่าง)
+        X+ = ขวา = Forward, X- = ซ้าย = Backward
+        """
+        return self.x - 320  # center of image
+    
+    @property
+    def coord_y(self) -> int:
+        """
+        Y ในระบบพิกัดใหม่ (origin ที่กลางล่าง)
+        Y = 480 - pixel_y (always positive, 0 at bottom)
+        """
+        return 480 - self.y
+    
+    @property
+    def bottom_y_from_image_bottom(self) -> int:
+        """
+        ระยะ pixel จากขอบล่างของภาพถึงขอบล่างของวัตถุ
+        ใช้สำหรับคำนวณระยะพ่น
+        """
+        bottom_edge = self.y + (self.height // 2)  # bottom edge of object
+        return 480 - bottom_edge
+    
+    @property
+    def h(self) -> int:
+        """Alias for height (for compatibility with main.py)"""
+        return self.height
 
 
 class WeedDetector:
     """
     YOLO11 Multi-Class Detector
     
-    ตรวจจับพืช 2 ประเภท:
-    - weed (หญ้า): class_id = 0 → ต้องพ่นยา
-    - chili (ต้นพริก): class_id = 1 → ห้ามพ่น
+    ตรวจจับหลาย class และเลือก target ได้:
+    - สามารถเลือก class ที่ต้องการพ่นได้ผ่าน set_target_classes()
+    - รองรับการเปลี่ยน target แบบ runtime
     
     การโหลดโมเดล:
     1. ถ้าระบุ model_path → ใช้ไฟล์นั้น
     2. ถ้าไม่ระบุ → ค้นหาใน models/ folder (best.pt)
     """
-    
-    # Class mapping (ปรับตามโมเดลที่ train)
-    TARGET_CLASSES = {
-        0: ("weed", True),      # (ชื่อ, ต้องพ่นหรือไม่)
-        1: ("chili", False),
-    }
     
     def __init__(
         self,
@@ -133,7 +167,7 @@ class WeedDetector:
         camera_id: int = 0,
         frame_width: int = 640,
         frame_height: int = 480,
-        confidence_threshold: float = 0.5,
+        confidence_threshold: float = 0.25,
         auto_load_model: bool = True
     ):
         """
@@ -160,11 +194,52 @@ class WeedDetector:
         self.cap: Optional[cv2.VideoCapture] = None
         self.model = None
         
+        # Dynamic target classes - ชื่อ class ที่ต้องการพ่น (เปลี่ยนได้)
+        # Default: พ่นเฉพาะ "weed"
+        self.target_class_names: set = {"weed"}
+        
         # โหลดโมเดล
         if model_path:
             self.load_yolo_model(model_path)
         elif auto_load_model:
             self._auto_load_model()
+    
+    def set_confidence_threshold(self, threshold: float) -> None:
+        """ปรับ confidence threshold (0.0 - 1.0)"""
+        self.confidence_threshold = max(0.1, min(1.0, threshold))
+        logger.info(f"🎚️ Confidence threshold set to: {self.confidence_threshold}")
+    
+    def get_confidence_threshold(self) -> float:
+        """ดึงค่า confidence threshold ปัจจุบัน"""
+        return self.confidence_threshold
+    
+    def set_target_classes(self, class_names: List[str]) -> None:
+        """
+        ตั้งค่า classes ที่ต้องการเป็น target (พ่นยา)
+        
+        Args:
+            class_names: รายชื่อ class ที่ต้องการพ่น เช่น ["weed"] หรือ ["weed", "chili"]
+        """
+        self.target_class_names = set(name.lower() for name in class_names)
+        logger.info(f"🎯 Target classes updated: {self.target_class_names}")
+    
+    def add_target_class(self, class_name: str) -> None:
+        """เพิ่ม class เป็น target"""
+        self.target_class_names.add(class_name.lower())
+        logger.info(f"➕ Added target class: {class_name}")
+    
+    def remove_target_class(self, class_name: str) -> None:
+        """ลบ class ออกจาก target"""
+        self.target_class_names.discard(class_name.lower())
+        logger.info(f"➖ Removed target class: {class_name}")
+    
+    def get_target_classes(self) -> List[str]:
+        """ดึงรายชื่อ target classes"""
+        return list(self.target_class_names)
+    
+    def is_class_target(self, class_name: str) -> bool:
+        """ตรวจสอบว่า class นี้เป็น target หรือไม่"""
+        return class_name.lower() in self.target_class_names
     
     def load_yolo_model(self, model_path: str) -> bool:
         """
@@ -245,11 +320,21 @@ class WeedDetector:
             "loaded": self.model is not None,
             "model_path": self.model_path,
             "model_name": Path(self.model_path).name if self.model_path else None,
-            "classes": None
+            "class_names": {},
+            "num_classes": 0,
+            "using_gpu": False
         }
         
         if self.model and hasattr(self.model, 'names'):
-            info["classes"] = self.model.names
+            info["class_names"] = self.model.names
+            info["num_classes"] = len(self.model.names)
+            
+            # Check if using GPU
+            try:
+                if hasattr(self.model, 'device'):
+                    info["using_gpu"] = 'cuda' in str(self.model.device)
+            except:
+                pass
         
         return info
     
@@ -366,12 +451,8 @@ class WeedDetector:
                     class_id = int(box.cls[0])
                     class_name = self.model.names.get(class_id, "unknown")
                     
-                    # ตรวจสอบว่าเป็น target หรือไม่
-                    is_target = False
-                    if class_id in self.TARGET_CLASSES:
-                        _, is_target = self.TARGET_CLASSES[class_id]
-                    elif class_name.lower() == "weed":
-                        is_target = True
+                    # ตรวจสอบว่าเป็น target หรือไม่ (ใช้ dynamic target classes)
+                    is_target = self.is_class_target(class_name)
                     
                     # Get coordinates
                     x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()

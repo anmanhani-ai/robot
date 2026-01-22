@@ -13,9 +13,9 @@
 MotorZ motorZ;
 
 void MotorZ::init() {
-    // 4-pin driver: ใช้ PWM ผ่าน IN1/IN2 โดยตรง
-    pinMode(PIN_MOTOR_Z_IN1, OUTPUT);
-    pinMode(PIN_MOTOR_Z_IN2, OUTPUT);
+    // 4-pin driver: ใช้ PWM ผ่าน IN3/IN4 โดยตรง
+    pinMode(PIN_MOTOR_Z_IN3, OUTPUT);
+    pinMode(PIN_MOTOR_Z_IN4, OUTPUT);
     // ไม่มี PWM pin แยก
     
     motorSpeed = MOTOR_Z_SPEED;
@@ -24,7 +24,7 @@ void MotorZ::init() {
     stop();
     
     Serial.println("[Motor Z] Initialized (4-pin driver)");
-    Serial.println("  IN1: GPIO" + String(PIN_MOTOR_Z_IN1) + ", IN2: GPIO" + String(PIN_MOTOR_Z_IN2));
+    Serial.println("  IN3: GPIO" + String(PIN_MOTOR_Z_IN3) + ", IN4: GPIO" + String(PIN_MOTOR_Z_IN4));
     Serial.print("  Encoder mode: ");
     Serial.println(encoderEnabled ? "ENABLED" : "DISABLED");
 }
@@ -140,24 +140,24 @@ void MotorZ::resetPosition() {
 }
 
 // ==================== LOW-LEVEL CONTROL ====================
-// 4-pin driver: ใช้ PWM โดยตรงผ่าน IN1/IN2
+// 4-pin driver: ใช้ PWM โดยตรงผ่าน IN3/IN4
 
 void MotorZ::runForward() {
-    // ยืดออก: IN1 = PWM, IN2 = 0
-    analogWrite(PIN_MOTOR_Z_IN1, motorSpeed);
-    analogWrite(PIN_MOTOR_Z_IN2, 0);
+    // ยืดออก: IN3 = PWM, IN4 = 0
+    analogWrite(PIN_MOTOR_Z_IN3, motorSpeed);
+    analogWrite(PIN_MOTOR_Z_IN4, 0);
 }
 
 void MotorZ::runBackward() {
-    // หดเข้า: IN1 = 0, IN2 = PWM
-    analogWrite(PIN_MOTOR_Z_IN1, 0);
-    analogWrite(PIN_MOTOR_Z_IN2, motorSpeed);
+    // หดเข้า: IN3 = 0, IN4 = PWM
+    analogWrite(PIN_MOTOR_Z_IN3, 0);
+    analogWrite(PIN_MOTOR_Z_IN4, motorSpeed);
 }
 
 void MotorZ::stop() {
     // หยุด: ทั้งคู่ = 0
-    analogWrite(PIN_MOTOR_Z_IN1, 0);
-    analogWrite(PIN_MOTOR_Z_IN2, 0);
+    analogWrite(PIN_MOTOR_Z_IN3, 0);
+    analogWrite(PIN_MOTOR_Z_IN4, 0);
 }
 
 void MotorZ::setSpeed(int speed) {

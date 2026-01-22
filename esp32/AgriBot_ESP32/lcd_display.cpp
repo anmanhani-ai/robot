@@ -8,6 +8,10 @@
 LCDDisplay lcdDisplay;
 
 void LCDDisplay::init() {
+    // ปิดการใช้งาน LCD เพราะเอาออกแล้ว และต้องการใช้ GPIO 21/22 สำหรับ Motor
+    // ถ้าต้องการใช้ LCD อีกครั้ง ให้ uncomment ด้านล่าง และเปลี่ยน Motor R pins
+    
+    /*
     lcd = new LiquidCrystal_I2C(LCD_ADDR, LCD_COLS, LCD_ROWS);
     lcd->init();
     lcd->backlight();
@@ -17,6 +21,10 @@ void LCDDisplay::init() {
     
     Serial.println("✅ LCD initialized");
     Serial.println("   Address: 0x" + String(LCD_ADDR, HEX));
+    */
+    
+    initialized = false;
+    Serial.println("ℹ️ LCD disabled (GPIO 21/22 used for Motor R)");
 }
 
 void LCDDisplay::showReady() {

@@ -4,7 +4,7 @@
  */
 
 import { useState, useEffect, useCallback } from 'react';
-import { Tractor, Wifi, WifiOff, Settings, Gamepad2 } from 'lucide-react';
+import { Tractor, Wifi, WifiOff, Settings, Gamepad2, Activity, Cpu, Brain, Focus } from 'lucide-react';
 
 // Components
 import StatusCard from './components/StatusCard';
@@ -14,6 +14,12 @@ import CameraFeed from './components/CameraFeed';
 import StateIndicator from './components/StateIndicator';
 import SettingsPage from './components/SettingsPage';
 import ManualControlPage from './components/ManualControlPage';
+import HealthCheckPage from './components/HealthCheckPage';
+import GpioConfigPage from './components/GpioConfigPage';
+// AutoTestPage removed
+import ModelSelectorPage from './components/ModelSelectorPage';
+import CalibrationPage from './components/CalibrationPage';
+import TerminalViewer from './components/TerminalViewer';
 
 // API
 import { getStatus, sendCommand, getLogs, downloadReport, resetReport, CAMERA_STREAM_URL } from './services/api';
@@ -36,7 +42,7 @@ export default function App() {
   const [isConnected, setIsConnected] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState(null);
-  const [currentPage, setCurrentPage] = useState('dashboard'); // 'dashboard' | 'settings' | 'manual'
+  const [currentPage, setCurrentPage] = useState('dashboard'); // 'dashboard' | 'settings' | 'manual' | 'health' | 'auto'
 
   // ==================== Data Fetching ====================
 
@@ -173,6 +179,59 @@ export default function App() {
 
           {/* Header Buttons */}
           <div className="flex items-center gap-2">
+            {/* Health Check Button */}
+            <button
+              onClick={() => setCurrentPage(currentPage === 'health' ? 'dashboard' : 'health')}
+              className={`p-2 rounded-lg transition-colors flex items-center gap-2 ${currentPage === 'health'
+                ? 'bg-purple-500 text-white'
+                : 'hover:bg-gray-700 text-gray-400'
+                }`}
+              title="ตรวจสอบอุปกรณ์"
+            >
+              <Activity className="w-5 h-5" />
+              <span className="hidden sm:inline text-sm">Health</span>
+            </button>
+
+            {/* GPIO Config Button */}
+            <button
+              onClick={() => setCurrentPage(currentPage === 'gpio' ? 'dashboard' : 'gpio')}
+              className={`p-2 rounded-lg transition-colors flex items-center gap-2 ${currentPage === 'gpio'
+                ? 'bg-orange-500 text-white'
+                : 'hover:bg-gray-700 text-gray-400'
+                }`}
+              title="ตั้งค่า GPIO"
+            >
+              <Cpu className="w-5 h-5" />
+            </button>
+
+            {/* Model Selector Button */}
+            <button
+              onClick={() => setCurrentPage(currentPage === 'model' ? 'dashboard' : 'model')}
+              className={`p-2 rounded-lg transition-colors flex items-center gap-2 ${currentPage === 'model'
+                ? 'bg-pink-500 text-white'
+                : 'hover:bg-gray-700 text-gray-400'
+                }`}
+              title="เลือก AI Model"
+            >
+              <Brain className="w-5 h-5" />
+              <span className="hidden sm:inline text-sm">Model</span>
+            </button>
+
+            {/* Calibration Button */}
+            <button
+              onClick={() => setCurrentPage(currentPage === 'calibration' ? 'dashboard' : 'calibration')}
+              className={`p-2 rounded-lg transition-colors flex items-center gap-2 ${currentPage === 'calibration'
+                ? 'bg-yellow-500 text-white'
+                : 'hover:bg-gray-700 text-gray-400'
+                }`}
+              title="Calibration Wizard"
+            >
+              <Focus className="w-5 h-5" />
+              <span className="hidden sm:inline text-sm">Calibrate</span>
+            </button>
+
+
+
             {/* Manual Control Button */}
             <button
               onClick={() => setCurrentPage(currentPage === 'manual' ? 'dashboard' : 'manual')}
@@ -213,6 +272,15 @@ export default function App() {
           <SettingsPage onBack={() => setCurrentPage('dashboard')} />
         ) : currentPage === 'manual' ? (
           <ManualControlPage onBack={() => setCurrentPage('dashboard')} />
+        ) : currentPage === 'health' ? (
+          <HealthCheckPage onBack={() => setCurrentPage('dashboard')} />
+        ) : currentPage === 'gpio' ? (
+          <GpioConfigPage onBack={() => setCurrentPage('dashboard')} />
+        ) : currentPage === 'model' ? (
+          <ModelSelectorPage onBack={() => setCurrentPage('dashboard')} />
+
+        ) : currentPage === 'calibration' ? (
+          <CalibrationPage onBack={() => setCurrentPage('dashboard')} />
         ) : (
           /* Main Grid - Dashboard */
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -222,6 +290,24 @@ export default function App() {
 
               {/* State Indicator */}
               <StateIndicator state={status.state} />
+
+              {/* Emergency Stop Button - Always Visible */}
+              {isRunning && (
+                <button
+                  onClick={handleStop}
+                  disabled={isLoading}
+                  className="w-full py-6 px-8 rounded-2xl font-bold text-2xl 
+                           bg-gradient-to-r from-red-600 to-red-700 
+                           hover:from-red-700 hover:to-red-800
+                           text-white shadow-lg shadow-red-500/30
+                           flex items-center justify-center gap-3
+                           animate-pulse border-2 border-red-400
+                           disabled:opacity-50"
+                >
+                  <span className="text-3xl">🛑</span>
+                  หยุดฉุกเฉิน
+                </button>
+              )}
 
               {/* Robot Speech Bubble */}
               <div className="bg-gradient-to-r from-primary-500/10 to-blue-500/10 
@@ -304,8 +390,11 @@ export default function App() {
                 isLoading={isLoading}
               />
 
+              {/* Terminal Viewer */}
+              <TerminalViewer maxHeight="250px" />
+
               {/* Activity Log */}
-              <LogViewer logs={logs} maxHeight="350px" />
+              <LogViewer logs={logs} maxHeight="300px" />
             </div>
           </div>
         )}

@@ -14,6 +14,7 @@
 #include "pump.h"
 #include "ultrasonic.h"
 #include "obstacle_avoidance.h"
+#include "gpio_config.h"
 
 class CommandHandler {
 public:

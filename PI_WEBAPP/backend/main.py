@@ -19,9 +19,10 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Optional, List
 from datetime import datetime
 from pathlib import Path
+import asyncio
 import json
 import csv
 import io
@@ -118,6 +119,10 @@ class RealRobotController:
         self.camera_connected = False
         self.error_message = ""
         
+        # Terminal logs for frontend viewer (max 100 entries)
+        self.terminal_logs: List[dict] = []
+        self.terminal_logs_lock = threading.Lock()
+        
         # Real robot components
         self.brain: Optional[RobotBrain] = None
         self.detector: Optional[WeedDetector] = None
@@ -125,6 +130,29 @@ class RealRobotController:
         
         # Initialize status file
         self._save_status()
+    
+    def add_terminal_log(self, message: str, log_type: str = "info"):
+        """เพิ่ม log เข้า terminal buffer (thread-safe)"""
+        with self.terminal_logs_lock:
+            entry = {
+                "timestamp": datetime.now().strftime("%H:%M:%S"),
+                "message": message,
+                "type": log_type  # info, success, warning, error, calc, cmd
+            }
+            self.terminal_logs.append(entry)
+            # Keep only last 100 entries
+            if len(self.terminal_logs) > 100:
+                self.terminal_logs = self.terminal_logs[-100:]
+    
+    def get_terminal_logs(self, limit: int = 50) -> List[dict]:
+        """ดึง terminal logs ล่าสุด"""
+        with self.terminal_logs_lock:
+            return self.terminal_logs[-limit:]
+    
+    def clear_terminal_logs(self):
+        """ล้าง terminal logs"""
+        with self.terminal_logs_lock:
+            self.terminal_logs = []
     
     def initialize_devices(self) -> bool:
         """เชื่อมต่อ ESP32 + Camera ตอน server start (ทั้งสองอุปกรณ์แยกกัน)"""
@@ -216,7 +244,7 @@ class RealRobotController:
         
         self._save_status()
     
-    def start_mission(self) -> dict:
+    def start_mission(self, single_shot: bool = False) -> dict:
         """เริ่ม Mission"""
         if not self.esp32_connected or not self.camera_connected:
             return {
@@ -227,6 +255,11 @@ class RealRobotController:
         if self.is_running:
             return {"success": False, "error": "Mission กำลังทำงานอยู่"}
         
+        # Stop background detection to avoid camera conflict
+        global _detection_running
+        _detection_running = False
+        time.sleep(0.2)  # Wait for detection thread to stop
+        
         self.is_running = True
         self.status.state = "Moving"
         self.say("moving")
@@ -235,11 +268,15 @@ class RealRobotController:
         append_log(LogEntry(
             timestamp=datetime.now().isoformat(),
             event="MISSION_START",
-            details="Mission started via web dashboard"
+            details=f"Mission started ({'Single Shot' if single_shot else 'Continuous'})"
         ))
         
-        # Start auto mode thread
-        self.thread = threading.Thread(target=self._auto_mode_loop, daemon=True)
+        # Start auto mode thread with single_shot parameter
+        self.thread = threading.Thread(
+            target=self._auto_mode_loop, 
+            args=(single_shot,),
+            daemon=True
+        )
         self.thread.start()
         
         return {"success": True}
@@ -261,6 +298,9 @@ class RealRobotController:
             details="Mission stopped by user"
         ))
         
+        # Restart background detection
+        _start_detection_thread()
+        
         return {"success": True}
     
     def reset(self) -> dict:
@@ -274,18 +314,55 @@ class RealRobotController:
         
         return {"success": True}
     
-    def _auto_mode_loop(self):
+    def _auto_mode_loop(self, single_shot: bool = False):
         """
-        Auto mode loop - ทำงานเหมือน main.py 
+        Auto mode loop - STOP-CALCULATE-MOVE LOGIC
+        
+        Flow:
+        1. เดินหน้าไปเรื่อยๆ จนกว่าจะพบเป้าหมาย
+        2. เจอเป้าหมาย → หยุดทันที! รอ 3 วินาที
+        3. คำนวณระยะจาก pixel ไปยังตรงกลาง → แปลงเป็นเวลา
+        4. เดินหน้าตามเวลาที่คำนวณ จนวัตถุอยู่ตรงกลาง
+        5. หยุด → ทำ Spray sequence
+        6. เสร็จ → หาวัตถุต่อไป
         """
         if not self.brain or not self.detector:
+            print("❌ Brain or Detector not available")
             return
         
+        print("🚀 Auto mode started (NEW COORDINATE SYSTEM)")
+        
+        # ================================================
+        # COORDINATE SYSTEM:
+        # - Origin (0,0) at BOTTOM CENTER of image (pixel 320, 480)
+        # - X-axis: left = backward (X-), right = forward (X+)
+        # - Y-axis: only POSITIVE, goes UP from origin
+        # - X = target_pixel_x - 320
+        # - Y = 480 - target_pixel_y (always positive)
+        # ================================================
+        
+        # Calibration constants
+        PIXEL_TO_CM = 0.05  # 1 pixel = 0.05 cm
+        WHEEL_SPEED_CM_PER_SEC = 5.0  # ความเร็วล้อ cm/s (ปรับได้)
+        IMG_WIDTH = 640
+        IMG_HEIGHT = 480
+        IMG_CENTER_X = IMG_WIDTH // 2  # 320
+        DETECTION_WAIT = 3.0  # หยุดรอ 3 วินาทีหลังเจอ
+        
+        # Spray sequence timings (seconds)
+        MOVE_FORWARD_BEFORE = 4.0
+        Y_DOWN_DURATION = 4.5
+        SPRAY_DURATION = 3.0
+        Y_UP_DURATION = 5.0
+        MOVE_FORWARD_AFTER = 4.0
+        
+        # Start moving forward
         self.brain.move_forward_speed(self.brain.SPEED_NORMAL)
+        self.status.state = "Searching"
         
         while self.is_running:
             try:
-                # Capture & detect
+                # Step 1: Capture & detect
                 frame = self.detector.capture_frame()
                 if frame is None:
                     time.sleep(0.05)
@@ -294,56 +371,180 @@ class RealRobotController:
                 all_detections = self.detector.detect(frame)
                 target = self.detector.get_nearest_target(all_detections)
                 
-                # Update counters
-                for det in all_detections:
-                    if det.is_target:
-                        self.status.weed_count += 1
-                    else:
-                        self.status.chili_count += 1
+                if target is None:
+                    # No target - keep moving and searching
+                    if self.status.state != "Searching":
+                        self.status.state = "Searching"
+                        self.brain.move_forward_speed(self.brain.SPEED_NORMAL)
+                        print("👁️ No target - searching...")
+                    time.sleep(0.1)
+                    continue
+                
+                # ================================================
+                # STEP 2: TARGET DETECTED! CONVERT TO NEW COORDINATES
+                # ================================================
+                # Convert pixel coordinates to new system
+                # X = target.x - 320 (center is 0)
+                # Y = 480 - target.y (bottom is 0, always positive)
+                coord_x = target.x - IMG_CENTER_X  # X+ = right = forward
+                coord_y = IMG_HEIGHT - target.y    # Y+ = up (always positive)
+                
+                print(f"🎯 TARGET DETECTED: {target.class_name}")
+                print(f"   Pixel: ({target.x}, {target.y})")
+                print(f"   Coord: (X={coord_x}, Y={coord_y})")
+                
+                # Add terminal logs for frontend
+                self.add_terminal_log(f"พบเป้าหมาย: {target.class_name}", "success")
+                self.add_terminal_log(f"ตำแหน่ง Pixel: ({target.x}, {target.y})", "info")
+                self.add_terminal_log(f"พิกัด: X={coord_x}px, Y={coord_y}px", "calc")
+                
+                # STOP robot immediately
+                self.brain.stop_movement()
+                self.status.state = "Target Detected"
+                self._save_status()
+                
+                print(f"🛑 STOPPED! Waiting {DETECTION_WAIT} seconds...")
+                self.add_terminal_log(f"หยุดรถ! รอ {DETECTION_WAIT} วินาที...", "cmd")
+                time.sleep(DETECTION_WAIT)
+                
+                # ================================================
+                # STEP 3: RE-CAPTURE AND CALCULATE DISTANCE
+                # ================================================
+                frame = self.detector.capture_frame()
+                if frame:
+                    all_detections = self.detector.detect(frame)
+                    target = self.detector.get_nearest_target(all_detections)
                 
                 if target is None:
-                    # No target - keep moving
-                    self.status.state = "Moving"
-                    self.status.distance_traveled += 0.05
-                else:
-                    # Has target - adjust speed
-                    distance_x = target.distance_from_center_x
-                    new_speed = self.brain.calculate_approach_speed(distance_x)
-                    
-                    if new_speed == 0:
-                        # Aligned - spray
-                        self.status.state = "Spraying"
-                        self._save_status()
-                        
-                        self.brain.stop_movement()
-                        time.sleep(0.1)
-                        
-                        distance_y = abs(target.distance_from_center_y)
-                        success = self.brain.execute_spray_mission(distance_y)
-                        
-                        if success:
-                            self.status.spray_count += 1
-                            append_log(LogEntry(
-                                timestamp=datetime.now().isoformat(),
-                                event="WEED_SPRAYED",
-                                x=target.x,
-                                y=target.y,
-                                details=f"Spray #{self.status.spray_count}"
-                            ))
-                        
-                        # Resume moving
-                        self.brain.move_forward_speed(self.brain.SPEED_NORMAL)
-                    else:
-                        self.brain.set_speed(new_speed)
+                    print("❌ Lost target after wait - resuming search")
+                    self.brain.move_forward_speed(self.brain.SPEED_NORMAL)
+                    self.status.state = "Searching"
+                    continue
                 
+                # Recalculate coordinates
+                coord_x = target.x - IMG_CENTER_X
+                
+                # ================================================
+                # STEP 3.5: CALCULATE Y (from bottom edge of image to bottom edge of object)
+                # ================================================
+                # target.y = center of object, target.h = height of object
+                target_bottom_y = target.y + (target.h // 2)  # bottom edge of object in pixel
+                pixels_from_bottom = IMG_HEIGHT - target_bottom_y  # distance from bottom edge of image
+                y_distance_cm = pixels_from_bottom * PIXEL_TO_CM  # convert to cm (1px = 0.05cm)
+                y_approach_time = y_distance_cm / 2.17  # use speed 2.17 cm/s as specified
+                
+                print(f"📏 CALCULATING:")
+                print(f"   Target X from center: {coord_x}px")
+                print(f"   Target bottom Y (pixel): {target_bottom_y}px")
+                print(f"   Pixels from bottom edge: {pixels_from_bottom}px")
+                print(f"   Y distance: {y_distance_cm:.2f}cm")
+                print(f"   Y approach time: {y_approach_time:.2f}s (at 2.17 cm/s)")
+                
+                # Calculate X movement time
+                distance_cm_x = coord_x * PIXEL_TO_CM
+                move_time = abs(distance_cm_x) / WHEEL_SPEED_CM_PER_SEC
+                print(f"   X distance: {distance_cm_x:.2f}cm, move time: {move_time:.2f}s")
+                
+                # ================================================
+                # STEP 4: SLOWLY MOVE TO CENTER THE TARGET (X = 0)
+                # ================================================
+                if move_time > 0.1:
+                    self.status.state = "Centering"
+                    self._save_status()
+                    
+                    if coord_x > 0:
+                        # X+ means target is to the right = need to move FORWARD slowly
+                        print(f"🐢 Slowly moving FORWARD for {move_time:.2f}s to center (X={coord_x})")
+                        self.brain.move_forward_speed(self.brain.SPEED_SLOW)  # Slow speed
+                        time.sleep(move_time)
+                        self.brain.stop_movement()
+                    else:
+                        # X- means target is to the left = need to move BACKWARD slowly
+                        print(f"🐢 Slowly moving BACKWARD for {move_time:.2f}s to center (X={coord_x})")
+                        self.brain.send_cmd("DRIVE_BW")
+                        time.sleep(move_time)
+                        self.brain.send_cmd("DRIVE_STOP")
+                    
+                    print("🛑 Stopped! Target should now be centered (X ≈ 0)")
+                    self.add_terminal_log("เป้าหมายอยู่ตรงกลางแล้ว (X ≈ 0)", "success")
+                    time.sleep(0.5)
+                
+                # ================================================
+                # STEP 5: EXECUTE SPRAY SEQUENCE
+                # ================================================
+                self.status.state = "Spraying"
                 self._save_status()
-                time.sleep(0.04)  # ~25 FPS
+                print("🚀 Starting spray sequence...")
+                self.add_terminal_log("🚀 เริ่ม Spray Sequence", "cmd")
+                
+                # 5.1: Move forward 4 seconds
+                print(f"   [1/5] Moving forward {MOVE_FORWARD_BEFORE}s...")
+                self.add_terminal_log(f"[1/5] เดินหน้า {MOVE_FORWARD_BEFORE} วินาที", "cmd")
+                self.brain.send_cmd("DRIVE_FW")
+                time.sleep(MOVE_FORWARD_BEFORE)
+                self.brain.send_cmd("DRIVE_STOP")
+                
+                # 5.2: Y-axis down 4.5 seconds
+                print(f"   [2/5] Y-axis down {Y_DOWN_DURATION}s...")
+                self.add_terminal_log(f"[2/5] หัวพ่นลง {Y_DOWN_DURATION} วินาที", "cmd")
+                self.brain.send_cmd(f"ACT:Y_DOWN:{Y_DOWN_DURATION}")
+                time.sleep(Y_DOWN_DURATION + 0.5)
+                
+                # 5.3: Spray 3 seconds
+                print(f"   [3/5] Spraying {SPRAY_DURATION}s...")
+                self.add_terminal_log(f"[3/5] พ่นยา {SPRAY_DURATION} วินาที", "cmd")
+                self.brain.send_cmd(f"ACT:SPRAY:{SPRAY_DURATION}")
+                time.sleep(SPRAY_DURATION + 0.5)
+                
+                # 5.4: Y-axis up 5 seconds
+                print(f"   [4/5] Y-axis up {Y_UP_DURATION}s...")
+                self.add_terminal_log(f"[4/5] หัวพ่นขึ้น {Y_UP_DURATION} วินาที", "cmd")
+                self.brain.send_cmd(f"ACT:Y_UP:{Y_UP_DURATION}")
+                time.sleep(Y_UP_DURATION + 0.5)
+                
+                # 5.5: Move forward 4 seconds
+                print(f"   [5/5] Moving forward {MOVE_FORWARD_AFTER}s...")
+                self.brain.send_cmd("DRIVE_FW")
+                time.sleep(MOVE_FORWARD_AFTER)
+                self.brain.send_cmd("DRIVE_STOP")
+                
+                # ================================================
+                # STEP 6: SPRAY COMPLETED!
+                # ================================================
+                self.status.spray_count += 1
+                print(f"✅ Spray #{self.status.spray_count} completed!")
+                
+                append_log(LogEntry(
+                    timestamp=datetime.now().isoformat(),
+                    event="TARGET_SPRAYED",
+                    x=target.x,
+                    y=target.y,
+                    details=f"Spray #{self.status.spray_count} - {target.class_name}"
+                ))
+                
+                # Check if single shot mode
+                if single_shot:
+                    print("🛑 Single shot mode - stopping mission")
+                    self.status.state = "Completed"
+                    self._save_status()
+                    self._auto_running = False
+                    self._stop_event.set()
+                    break
+                
+                # Resume searching for next target
+                print("🔄 Resuming search for next target...")
+                self.status.state = "Searching"
+                self.brain.move_forward_speed(self.brain.SPEED_NORMAL)
+                time.sleep(1.0)  # Brief pause
                 
             except Exception as e:
                 print(f"❌ Auto mode error: {e}")
+                import traceback
+                traceback.print_exc()
                 time.sleep(0.1)
         
         # Stopped
+        print("🛑 Auto mode stopped")
         self.brain.stop_movement()
     
     def get_status(self) -> dict:
@@ -448,9 +649,16 @@ async def send_command(request: CommandRequest):
     cmd = request.command.lower()
     
     if cmd == "start":
-        result = robot.start_mission()
+        result = robot.start_mission(single_shot=False)
         if result.get("success"):
-            return {"success": True, "message": "Mission started"}
+            return {"success": True, "message": "Mission started (Continuous)"}
+        else:
+            return {"success": False, "message": result.get("error", "ไม่สามารถเริ่ม Mission ได้")}
+            
+    elif cmd == "start_single":
+        result = robot.start_mission(single_shot=True)
+        if result.get("success"):
+            return {"success": True, "message": "Mission started (Single Shot)"}
         else:
             return {"success": False, "message": result.get("error", "ไม่สามารถเริ่ม Mission ได้")}
     
@@ -461,6 +669,100 @@ async def send_command(request: CommandRequest):
     elif cmd == "reset":
         result = robot.reset()
         return {"success": True, "message": "System reset"}
+    
+    elif cmd == "arm_test":
+        # ทดสอบแขนกล: ใช้ตำแหน่งจริงจาก detection
+        if not robot.brain:
+            return {"success": False, "message": "Brain not initialized"}
+        if not robot.detector:
+            return {"success": False, "message": "Detector not initialized"}
+        
+        try:
+            # 1. Capture และ detect
+            frame = robot.detector.capture_frame()
+            if frame is None:
+                return {"success": False, "message": "❌ Cannot capture frame"}
+            
+            all_detections = robot.detector.detect(frame)
+            target = robot.detector.get_nearest_target(all_detections)
+            
+            if target is None:
+                return {"success": False, "message": "❌ No target detected! วางวัตถุหน้ากล้องก่อน"}
+            
+            # 2. คำนวณระยะ X (ระยะยืดแขน)
+            dist_x = abs(target.distance_from_center_x)
+            dist_y = target.distance_from_center_y
+            
+            # 3. คำนวณเวลายืดแขน
+            t_move, distance_cm = robot.brain.calculate_z_distance(dist_x)
+            
+            # 4. Log ข้อมูล
+            info_msg = f"🎯 Target: {target.class_name}\n"
+            info_msg += f"📍 Position: X={target.x}, Y={target.y}\n"
+            info_msg += f"📏 Distance: X={dist_x}px, Y={dist_y}px\n"
+            info_msg += f"⏱️ Arm extend: {distance_cm:.1f}cm = {t_move:.2f}s"
+            print(info_msg)
+            
+            # 5. Execute spray mission
+            success = robot.brain.execute_spray_mission(dist_x)
+            
+            if success:
+                return {
+                    "success": True, 
+                    "message": f"✅ Arm test completed!\n{info_msg}",
+                    "target": target.class_name,
+                    "dist_x": dist_x,
+                    "dist_y": dist_y,
+                    "arm_distance_cm": round(distance_cm, 1),
+                    "arm_time_sec": round(t_move, 2)
+                }
+            else:
+                return {"success": False, "message": f"❌ Arm test failed\n{info_msg}"}
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return {"success": False, "message": f"Error: {str(e)}"}
+    
+    elif cmd == "arm_extend":
+        # ยืดแขน - ใช้ duration จาก params (default 1.0 วินาที)
+        duration = 1.0
+        if request.params and "duration" in request.params:
+            duration = float(request.params["duration"])
+        if robot.brain:
+            robot.brain.extend_arm(duration)
+            return {"success": True, "message": f"Arm extended for {duration}s"}
+        return {"success": False, "message": "Brain not ready"}
+    
+    elif cmd == "arm_retract":
+        # หดแขน - ใช้ duration จาก params (default 1.0 วินาที)
+        duration = 1.0
+        if request.params and "duration" in request.params:
+            duration = float(request.params["duration"])
+        if robot.brain:
+            robot.brain.retract_arm(duration)
+            return {"success": True, "message": f"Arm retracted for {duration}s"}
+        return {"success": False, "message": "Brain not ready"}
+    
+    elif cmd == "head_down":
+        # หัวฉีดลง
+        if robot.brain:
+            robot.brain.lower_spray_head()
+            return {"success": True, "message": "Head lowered"}
+        return {"success": False, "message": "Brain not ready"}
+    
+    elif cmd == "head_up":
+        # หัวฉีดขึ้น
+        if robot.brain:
+            robot.brain.raise_spray_head()
+            return {"success": True, "message": "Head raised"}
+        return {"success": False, "message": "Brain not ready"}
+    
+    elif cmd == "spray":
+        # พ่นน้ำ 1 วินาที
+        if robot.brain:
+            robot.brain.spray(1.0)
+            return {"success": True, "message": "Spray done"}
+        return {"success": False, "message": "Brain not ready"}
     
     else:
         raise HTTPException(status_code=400, detail=f"Unknown command: {cmd}")
@@ -533,15 +835,93 @@ async def get_logs(limit: int = 50):
     return logs[-limit:]  # ส่ง log ล่าสุด
 
 
+@app.get("/api/terminal")
+async def get_terminal_logs(limit: int = 50):
+    """
+    GET /api/terminal
+    ดึง terminal logs สำหรับ Terminal Viewer บน Dashboard
+    แสดงข้อมูลการคำนวณ คำสั่ง และสถานะแบบ real-time
+    """
+    return robot.get_terminal_logs(limit)
+
+
+@app.delete("/api/terminal")
+async def clear_terminal_logs():
+    """
+    DELETE /api/terminal
+    ล้าง terminal logs
+    """
+    robot.clear_terminal_logs()
+    return {"success": True, "message": "Terminal logs cleared"}
+
+
 # ==================== SETTINGS API ====================
 CALIBRATION_FILE = Path(__file__).parent.parent.parent / "raspberry_pi" / "calibration.json"
 
 class ArmSettings(BaseModel):
-    max_arm_extend_cm: float = 50.0
-    arm_base_offset_cm: float = 5.0
-    arm_speed_cm_per_sec: float = 10.0
-    servo_y_angle_down: int = 90
-    servo_y_angle_up: int = 0
+    # === ARM CONFIGURATION ===
+    arm_links: list = [15.5, 0, 0]
+    joint_z_min: float = 0
+    joint_z_max: float = 15.5
+    joint_y_min: float = -90
+    joint_y_max: float = 90
+    
+    # === SPEED & MOTION CONTROL ===
+    max_speed_percent: int = 60
+    acceleration: int = 30
+    deceleration: int = 30
+    position_tolerance_cm: float = 0.5
+    angle_tolerance_deg: float = 2
+    retry_attempts: int = 3
+    
+    # Legacy arm Z settings
+    max_arm_extend_cm: float = 15.5
+    arm_base_offset_cm: float = 9.0
+    arm_speed_cm_per_sec: float = 2.21
+    arm_z_default_cm: float = 0.0
+    
+    # Legacy arm Y settings
+    motor_y_speed_cm_per_sec: float = 5.0
+    motor_y_default_cm: float = 0.0
+    motor_y_max_cm: float = 20.0
+    
+    # === CAMERA CALIBRATION ===
+    camera_height_cm: float = 50.0
+    camera_angle_deg: float = 45.0
+    camera_fov_deg: float = 60.0
+    pixel_to_cm_ratio: float = 0.034
+    workspace_x_min: float = -30
+    workspace_x_max: float = 30
+    workspace_y_min: float = -30
+    workspace_y_max: float = 30
+    workspace_z_min: float = 0
+    workspace_z_max: float = 20
+    
+    # === MOTION PLANNING ===
+    motion_type: str = "direct"
+    approach_height_cm: float = 5.0
+    approach_speed_percent: int = 50
+    retreat_height_cm: float = 5.0
+    
+    # === CONTROL MODES ===
+    operation_mode: str = "auto"
+    control_method: str = "inverse_kinematics"
+    
+    # === SAFETY SETTINGS ===
+    emergency_stop_enabled: bool = True
+    collision_detection_enabled: bool = False
+    timeout_seconds: int = 30
+    on_target_lost: str = "stop"
+    on_unreachable: str = "alert"
+    
+    # === PID TUNING ===
+    pid_kp: float = 2.0
+    pid_ki: float = 0.1
+    pid_kd: float = 0.05
+    moving_average_window: int = 5
+    kalman_filter_enabled: bool = False
+    
+    # === SPRAY SETTINGS ===
     default_spray_duration: float = 1.0
 
 
@@ -551,25 +931,84 @@ async def get_settings():
     GET /api/settings
     ดึงค่าตั้งค่าแขนกลจาก calibration.json
     """
+    defaults = ArmSettings()
     try:
         if CALIBRATION_FILE.exists():
             with open(CALIBRATION_FILE, 'r') as f:
                 data = json.load(f)
             
-            # Extract relevant settings
+            # Return all settings with defaults
             return {
-                "max_arm_extend_cm": data.get("max_arm_extend_cm", 50.0),
-                "arm_base_offset_cm": data.get("arm_base_offset_cm", 5.0),
-                "arm_speed_cm_per_sec": data.get("arm_speed_cm_per_sec", 10.0),
-                "servo_y_angle_down": data.get("servo_y_angle_down", 90),
-                "servo_y_angle_up": data.get("servo_y_angle_up", 0),
-                "default_spray_duration": data.get("default_spray_duration", 1.0),
+                # ARM CONFIGURATION
+                "arm_links": data.get("arm_links", defaults.arm_links),
+                "joint_z_min": data.get("joint_z_min", defaults.joint_z_min),
+                "joint_z_max": data.get("joint_z_max", defaults.joint_z_max),
+                "joint_y_min": data.get("joint_y_min", defaults.joint_y_min),
+                "joint_y_max": data.get("joint_y_max", defaults.joint_y_max),
+                
+                # SPEED & MOTION CONTROL
+                "max_speed_percent": data.get("max_speed_percent", defaults.max_speed_percent),
+                "acceleration": data.get("acceleration", defaults.acceleration),
+                "deceleration": data.get("deceleration", defaults.deceleration),
+                "position_tolerance_cm": data.get("position_tolerance_cm", defaults.position_tolerance_cm),
+                "angle_tolerance_deg": data.get("angle_tolerance_deg", defaults.angle_tolerance_deg),
+                "retry_attempts": data.get("retry_attempts", defaults.retry_attempts),
+                
+                # Legacy arm Z
+                "max_arm_extend_cm": data.get("max_arm_extend_cm", defaults.max_arm_extend_cm),
+                "arm_base_offset_cm": data.get("arm_base_offset_cm", defaults.arm_base_offset_cm),
+                "arm_speed_cm_per_sec": data.get("arm_speed_cm_per_sec", defaults.arm_speed_cm_per_sec),
+                "arm_z_default_cm": data.get("arm_z_default_cm", defaults.arm_z_default_cm),
+                
+                # Legacy arm Y
+                "motor_y_speed_cm_per_sec": data.get("motor_y_speed_cm_per_sec", defaults.motor_y_speed_cm_per_sec),
+                "motor_y_default_cm": data.get("motor_y_default_cm", defaults.motor_y_default_cm),
+                "motor_y_max_cm": data.get("motor_y_max_cm", defaults.motor_y_max_cm),
+                
+                # CAMERA CALIBRATION
+                "camera_height_cm": data.get("camera_height_cm", defaults.camera_height_cm),
+                "camera_angle_deg": data.get("camera_angle_deg", defaults.camera_angle_deg),
+                "camera_fov_deg": data.get("camera_fov_deg", defaults.camera_fov_deg),
+                "pixel_to_cm_ratio": data.get("pixel_to_cm_ratio", defaults.pixel_to_cm_ratio),
+                "workspace_x_min": data.get("workspace_x_min", defaults.workspace_x_min),
+                "workspace_x_max": data.get("workspace_x_max", defaults.workspace_x_max),
+                "workspace_y_min": data.get("workspace_y_min", defaults.workspace_y_min),
+                "workspace_y_max": data.get("workspace_y_max", defaults.workspace_y_max),
+                "workspace_z_min": data.get("workspace_z_min", defaults.workspace_z_min),
+                "workspace_z_max": data.get("workspace_z_max", defaults.workspace_z_max),
+                
+                # MOTION PLANNING
+                "motion_type": data.get("motion_type", defaults.motion_type),
+                "approach_height_cm": data.get("approach_height_cm", defaults.approach_height_cm),
+                "approach_speed_percent": data.get("approach_speed_percent", defaults.approach_speed_percent),
+                "retreat_height_cm": data.get("retreat_height_cm", defaults.retreat_height_cm),
+                
+                # CONTROL MODES
+                "operation_mode": data.get("operation_mode", defaults.operation_mode),
+                "control_method": data.get("control_method", defaults.control_method),
+                
+                # SAFETY SETTINGS
+                "emergency_stop_enabled": data.get("emergency_stop_enabled", defaults.emergency_stop_enabled),
+                "collision_detection_enabled": data.get("collision_detection_enabled", defaults.collision_detection_enabled),
+                "timeout_seconds": data.get("timeout_seconds", defaults.timeout_seconds),
+                "on_target_lost": data.get("on_target_lost", defaults.on_target_lost),
+                "on_unreachable": data.get("on_unreachable", defaults.on_unreachable),
+                
+                # PID TUNING
+                "pid_kp": data.get("pid_kp", defaults.pid_kp),
+                "pid_ki": data.get("pid_ki", defaults.pid_ki),
+                "pid_kd": data.get("pid_kd", defaults.pid_kd),
+                "moving_average_window": data.get("moving_average_window", defaults.moving_average_window),
+                "kalman_filter_enabled": data.get("kalman_filter_enabled", defaults.kalman_filter_enabled),
+                
+                # SPRAY SETTINGS
+                "default_spray_duration": data.get("default_spray_duration", defaults.default_spray_duration),
             }
     except Exception as e:
         print(f"Error reading settings: {e}")
     
     # Return defaults
-    return ArmSettings().model_dump()
+    return defaults.model_dump()
 
 
 @app.post("/api/settings")
@@ -585,20 +1024,81 @@ async def save_settings(settings: ArmSettings):
             with open(CALIBRATION_FILE, 'r') as f:
                 data = json.load(f)
         
-        # Update with new settings
+        # === Update all settings ===
+        
+        # ARM CONFIGURATION
+        data["arm_links"] = settings.arm_links
+        data["joint_z_min"] = settings.joint_z_min
+        data["joint_z_max"] = settings.joint_z_max
+        data["joint_y_min"] = settings.joint_y_min
+        data["joint_y_max"] = settings.joint_y_max
+        
+        # SPEED & MOTION CONTROL
+        data["max_speed_percent"] = settings.max_speed_percent
+        data["acceleration"] = settings.acceleration
+        data["deceleration"] = settings.deceleration
+        data["position_tolerance_cm"] = settings.position_tolerance_cm
+        data["angle_tolerance_deg"] = settings.angle_tolerance_deg
+        data["retry_attempts"] = settings.retry_attempts
+        
+        # Legacy arm Z
         data["max_arm_extend_cm"] = settings.max_arm_extend_cm
         data["arm_base_offset_cm"] = settings.arm_base_offset_cm
         data["arm_speed_cm_per_sec"] = settings.arm_speed_cm_per_sec
-        data["servo_y_angle_down"] = settings.servo_y_angle_down
-        data["servo_y_angle_up"] = settings.servo_y_angle_up
+        data["arm_z_default_cm"] = settings.arm_z_default_cm
+        
+        # Legacy arm Y
+        data["motor_y_speed_cm_per_sec"] = settings.motor_y_speed_cm_per_sec
+        data["motor_y_default_cm"] = settings.motor_y_default_cm
+        data["motor_y_max_cm"] = settings.motor_y_max_cm
+        
+        # CAMERA CALIBRATION
+        data["camera_height_cm"] = settings.camera_height_cm
+        data["camera_angle_deg"] = settings.camera_angle_deg
+        data["camera_fov_deg"] = settings.camera_fov_deg
+        data["pixel_to_cm_ratio"] = settings.pixel_to_cm_ratio
+        data["workspace_x_min"] = settings.workspace_x_min
+        data["workspace_x_max"] = settings.workspace_x_max
+        data["workspace_y_min"] = settings.workspace_y_min
+        data["workspace_y_max"] = settings.workspace_y_max
+        data["workspace_z_min"] = settings.workspace_z_min
+        data["workspace_z_max"] = settings.workspace_z_max
+        
+        # MOTION PLANNING
+        data["motion_type"] = settings.motion_type
+        data["approach_height_cm"] = settings.approach_height_cm
+        data["approach_speed_percent"] = settings.approach_speed_percent
+        data["retreat_height_cm"] = settings.retreat_height_cm
+        
+        # CONTROL MODES
+        data["operation_mode"] = settings.operation_mode
+        data["control_method"] = settings.control_method
+        
+        # SAFETY SETTINGS
+        data["emergency_stop_enabled"] = settings.emergency_stop_enabled
+        data["collision_detection_enabled"] = settings.collision_detection_enabled
+        data["timeout_seconds"] = settings.timeout_seconds
+        data["on_target_lost"] = settings.on_target_lost
+        data["on_unreachable"] = settings.on_unreachable
+        
+        # PID TUNING
+        data["pid_kp"] = settings.pid_kp
+        data["pid_ki"] = settings.pid_ki
+        data["pid_kd"] = settings.pid_kd
+        data["moving_average_window"] = settings.moving_average_window
+        data["kalman_filter_enabled"] = settings.kalman_filter_enabled
+        
+        # SPRAY SETTINGS
         data["default_spray_duration"] = settings.default_spray_duration
+        
+        # Timestamp
         data["settings_updated_at"] = datetime.now().isoformat()
         
         # Save
         with open(CALIBRATION_FILE, 'w') as f:
             json.dump(data, f, indent=2)
         
-        print(f"✅ Settings saved: max_arm={settings.max_arm_extend_cm}cm")
+        print(f"✅ Settings saved: Z speed={settings.arm_speed_cm_per_sec}cm/s, PID={settings.pid_kp}/{settings.pid_ki}/{settings.pid_kd}")
         return {"success": True, "message": "Settings saved"}
         
     except Exception as e:
@@ -840,6 +1340,208 @@ def create_error_frame(message: str) -> bytes:
     return buffer.tobytes()
 
 
+# ==================== Model API ====================
+
+@app.get("/api/models")
+async def list_models():
+    """
+    GET /api/models
+    ดึงรายการโมเดลที่มีใน models/ folder
+    """
+    try:
+        from pathlib import Path
+        models_dir = Path(__file__).parent.parent.parent / "raspberry_pi" / "models"
+        
+        if not models_dir.exists():
+            return {"models": [], "current": None}
+        
+        models = [f.name for f in models_dir.glob("*.pt")]
+        
+        # Get current model
+        current = None
+        if robot.detector and hasattr(robot.detector, 'model_path'):
+            current = Path(robot.detector.model_path).name if robot.detector.model_path else None
+        
+        return {
+            "models": sorted(models),
+            "current": current,
+            "models_dir": str(models_dir)
+        }
+    except Exception as e:
+        print(f"Error listing models: {e}")
+        return {"models": [], "current": None, "error": str(e)}
+
+
+@app.post("/api/models/{model_name}")
+async def select_model(model_name: str):
+    """
+    POST /api/models/{model_name}
+    เลือกและโหลดโมเดลใหม่
+    """
+    try:
+        from pathlib import Path
+        models_dir = Path(__file__).parent.parent.parent / "raspberry_pi" / "models"
+        model_path = models_dir / model_name
+        
+        if not model_path.exists():
+            raise HTTPException(status_code=404, detail=f"Model not found: {model_name}")
+        
+        if not robot.detector:
+            raise HTTPException(status_code=400, detail="Detector not initialized")
+        
+        # Load new model
+        success = robot.detector.load_yolo_model(str(model_path))
+        
+        if success:
+            print(f"✅ Model changed to: {model_name}")
+            return {"success": True, "message": f"โหลดโมเดล {model_name} สำเร็จ", "model": model_name}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to load model")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/models/info")
+async def get_model_info():
+    """
+    GET /api/models/info
+    ดึงข้อมูลโมเดลที่ใช้งานอยู่
+    """
+    if not robot.detector:
+        return {"loaded": False, "error": "Detector not initialized"}
+    
+    info = robot.detector.get_model_info()
+    return info
+
+
+@app.get("/api/detection/debug")
+async def detection_debug():
+    """
+    GET /api/detection/debug
+    Debug info สำหรับตรวจสอบ detection
+    """
+    return {
+        "camera_connected": robot.camera_connected,
+        "detector_exists": robot.detector is not None,
+        "model_loaded": robot.detector.model is not None if robot.detector else False,
+        "model_path": robot.detector.model_path if robot.detector else None,
+        "target_classes": robot.detector.get_target_classes() if robot.detector else [],
+        "confidence_threshold": robot.detector.get_confidence_threshold() if robot.detector else 0,
+        "detection_thread_running": _detection_running,
+        "cached_boxes_count": len(_detection_boxes),
+        "cached_boxes": _detection_boxes[:5]  # แสดง 5 อันแรก
+    }
+
+
+# ==================== Confidence API ====================
+
+@app.get("/api/confidence")
+async def get_confidence():
+    """GET /api/confidence - ดึงค่า confidence threshold"""
+    if not robot.detector:
+        return {"confidence": 0.25, "error": "Detector not initialized"}
+    return {"confidence": robot.detector.get_confidence_threshold()}
+
+
+@app.post("/api/confidence/{value}")
+async def set_confidence(value: float):
+    """POST /api/confidence/{value} - ตั้งค่า confidence threshold (0.1-1.0)"""
+    if not robot.detector:
+        raise HTTPException(status_code=400, detail="Detector not initialized")
+    
+    robot.detector.set_confidence_threshold(value)
+    return {
+        "success": True,
+        "confidence": robot.detector.get_confidence_threshold()
+    }
+
+
+# ==================== Target Classes API ====================
+
+@app.get("/api/targets")
+async def get_target_classes():
+    """
+    GET /api/targets
+    ดึงรายชื่อ classes ที่เป็น target (จะถูกพ่นยา)
+    """
+    if not robot.detector:
+        return {"error": "Detector not initialized", "targets": [], "available_classes": []}
+    
+    # Get available classes from model
+    available = []
+    if robot.detector.model and hasattr(robot.detector.model, 'names'):
+        available = list(robot.detector.model.names.values())
+    
+    return {
+        "targets": robot.detector.get_target_classes(),
+        "available_classes": available
+    }
+
+
+class TargetClassesRequest(BaseModel):
+    targets: List[str]
+
+
+@app.post("/api/targets")
+async def set_target_classes(request: TargetClassesRequest):
+    """
+    POST /api/targets
+    ตั้งค่า classes ที่เป็น target
+    
+    Body: {"targets": ["weed", "chili"]}
+    """
+    if not robot.detector:
+        raise HTTPException(status_code=400, detail="Detector not initialized")
+    
+    robot.detector.set_target_classes(request.targets)
+    
+    return {
+        "success": True,
+        "message": f"Target classes updated: {request.targets}",
+        "targets": robot.detector.get_target_classes()
+    }
+
+
+@app.post("/api/targets/add/{class_name}")
+async def add_target_class(class_name: str):
+    """
+    POST /api/targets/add/{class_name}
+    เพิ่ม class เป็น target
+    """
+    if not robot.detector:
+        raise HTTPException(status_code=400, detail="Detector not initialized")
+    
+    robot.detector.add_target_class(class_name)
+    
+    return {
+        "success": True,
+        "message": f"Added target: {class_name}",
+        "targets": robot.detector.get_target_classes()
+    }
+
+
+@app.post("/api/targets/remove/{class_name}")
+async def remove_target_class(class_name: str):
+    """
+    POST /api/targets/remove/{class_name}
+    ลบ class ออกจาก target
+    """
+    if not robot.detector:
+        raise HTTPException(status_code=400, detail="Detector not initialized")
+    
+    robot.detector.remove_target_class(class_name)
+    
+    return {
+        "success": True,
+        "message": f"Removed target: {class_name}",
+        "targets": robot.detector.get_target_classes()
+    }
+
+
 # ==================== MANUAL CONTROL API ====================
 
 class ManualCommandRequest(BaseModel):
@@ -872,52 +1574,79 @@ async def manual_control(request: ManualCommandRequest):
     try:
         # Movement commands
         if cmd == "MOVE_FORWARD":
-            robot.brain.send_command("DRIVE_FW")
+            robot.brain.send_cmd("DRIVE_FW")
             robot.say("moving")
             return {"success": True, "message": "กำลังเดินหน้า"}
         
         elif cmd == "MOVE_BACKWARD":
-            robot.brain.send_command("DRIVE_BW")
+            robot.brain.send_cmd("DRIVE_BW")
             return {"success": True, "message": "กำลังถอยหลัง"}
         
         elif cmd == "MOVE_LEFT":
-            robot.brain.send_command("TURN_LEFT")
+            robot.brain.send_cmd("TURN_LEFT")
             return {"success": True, "message": "กำลังเลี้ยวซ้าย"}
         
         elif cmd == "MOVE_RIGHT":
-            robot.brain.send_command("TURN_RIGHT")
+            robot.brain.send_cmd("TURN_RIGHT")
             return {"success": True, "message": "กำลังเลี้ยวขวา"}
         
         elif cmd == "MOVE_STOP":
-            robot.brain.send_command("DRIVE_STOP")
+            robot.brain.send_cmd("DRIVE_STOP")
             return {"success": True, "message": "หยุดแล้ว"}
+        
+        # Timed Movement commands (MOVE_FW:duration, MOVE_BW:duration)
+        elif cmd.startswith("MOVE_FW:"):
+            duration = float(cmd.split(":")[1])
+            robot.brain.send_cmd("DRIVE_FW")
+            robot.say("moving")
+            await asyncio.sleep(duration)
+            robot.brain.send_cmd("DRIVE_STOP")
+            return {"success": True, "message": f"เดินหน้า {duration} วินาที เสร็จแล้ว"}
+        
+        elif cmd.startswith("MOVE_BW:"):
+            duration = float(cmd.split(":")[1])
+            robot.brain.send_cmd("DRIVE_BW")
+            await asyncio.sleep(duration)
+            robot.brain.send_cmd("DRIVE_STOP")
+            return {"success": True, "message": f"ถอยหลัง {duration} วินาที เสร็จแล้ว"}
         
         # Arm Z commands
         elif cmd.startswith("ACT:Z_OUT:"):
             duration = cmd.split(":")[2]
-            robot.brain.send_command(f"ACT:Z_OUT:{duration}")
+            robot.brain.send_cmd(f"ACT:Z_OUT:{duration}")
             robot.say("arm_extend")
             return {"success": True, "message": f"ยืดแขน {duration} วินาที"}
         
         elif cmd.startswith("ACT:Z_IN:"):
             duration = cmd.split(":")[2]
-            robot.brain.send_command(f"ACT:Z_IN:{duration}")
+            robot.brain.send_cmd(f"ACT:Z_IN:{duration}")
             robot.say("arm_retract")
             return {"success": True, "message": f"หดแขน {duration} วินาที"}
         
         # Arm Y commands
         elif cmd == "ACT:Y_UP":
-            robot.brain.send_command("ACT:Y_UP")
+            robot.brain.send_cmd("ACT:Y_UP")
             return {"success": True, "message": "ยกหัวพ่นขึ้น"}
         
         elif cmd == "ACT:Y_DOWN":
-            robot.brain.send_command("ACT:Y_DOWN")
+            robot.brain.send_cmd("ACT:Y_DOWN")
             return {"success": True, "message": "วางหัวพ่นลง"}
+        
+        # Arm Y with duration (Y_UP:<seconds>, Y_DOWN:<seconds>)
+        elif cmd.startswith("Y_UP:"):
+            duration = cmd.split(":")[1]
+            robot.brain.send_cmd(f"Y_UP:{duration}")
+            return {"success": True, "message": f"ยกหัวพ่นขึ้น {duration} วินาที"}
+        
+        elif cmd.startswith("Y_DOWN:"):
+            duration = cmd.split(":")[1]
+            robot.brain.send_cmd(f"Y_DOWN:{duration}")
+            return {"success": True, "message": f"วางหัวพ่นลง {duration} วินาที"}
         
         # Spray command
         elif cmd.startswith("ACT:SPRAY:"):
             duration = cmd.split(":")[2]
-            robot.brain.send_command(f"ACT:SPRAY:{duration}")
+            robot.brain.send_cmd(f"ACT:SPRAY:{duration}")
             robot.say("spraying")
             robot.status.spray_count += 1
             robot._save_status()
@@ -933,16 +1662,16 @@ async def manual_control(request: ManualCommandRequest):
         
         # Pump direct control
         elif cmd == "PUMP_ON":
-            robot.brain.send_command("PUMP_ON")
+            robot.brain.send_cmd("PUMP_ON")
             return {"success": True, "message": "เปิดปั๊ม"}
         
         elif cmd == "PUMP_OFF":
-            robot.brain.send_command("PUMP_OFF")
+            robot.brain.send_cmd("PUMP_OFF")
             return {"success": True, "message": "ปิดปั๊ม"}
         
         # Emergency stop
         elif cmd == "STOP_ALL":
-            robot.brain.send_command("STOP_ALL")
+            robot.brain.send_cmd("STOP_ALL")
             robot.is_running = False
             robot.status.state = "Stopped"
             robot.say("stopped")
@@ -957,7 +1686,7 @@ async def manual_control(request: ManualCommandRequest):
         
         # Ultrasonic read
         elif cmd == "US_GET_DIST":
-            robot.brain.send_command("US_GET_DIST")
+            robot.brain.send_cmd("US_GET_DIST")
             return {"success": True, "message": "อ่านค่า Ultrasonic"}
         
         else:
@@ -965,6 +1694,326 @@ async def manual_control(request: ManualCommandRequest):
     
     except Exception as e:
         print(f"❌ Manual control error: {e}")
+        return {"success": False, "error": str(e)}
+
+
+# ==================== HEALTH CHECK API ====================
+
+class DeviceStatus:
+    """สถานะของอุปกรณ์"""
+    OK = "ok"
+    WARNING = "warning"
+    ERROR = "error"
+
+def create_device_result(status: str, message: str, details: dict = None) -> dict:
+    """สร้างผลลัพธ์สำหรับอุปกรณ์"""
+    result = {"status": status, "message": message}
+    if details:
+        result["details"] = details
+    return result
+
+
+@app.get("/api/health")
+async def get_health_status():
+    """
+    GET /api/health
+    ตรวจสอบสถานะอุปกรณ์ทั้งหมด
+    """
+    results = {}
+    
+    # 1. ESP32 Connection
+    if robot.esp32_connected and robot.brain:
+        try:
+            # Send PING to check connection
+            start_time = time.time()
+            robot.brain.ser.reset_input_buffer()
+            robot.brain.ser.write(b"PING\n")
+            
+            # Wait for PONG
+            response = ""
+            timeout = time.time() + 2
+            while time.time() < timeout:
+                if robot.brain.ser.in_waiting > 0:
+                    response = robot.brain.ser.readline().decode().strip()
+                    if response == "PONG":
+                        break
+                time.sleep(0.01)
+            
+            latency = int((time.time() - start_time) * 1000)
+            
+            if response == "PONG":
+                results["esp32"] = create_device_result(
+                    DeviceStatus.OK, 
+                    f"เชื่อมต่อแล้ว ({latency}ms)",
+                    {"latency_ms": latency, "port": robot.brain.config.serial_port}
+                )
+            else:
+                results["esp32"] = create_device_result(
+                    DeviceStatus.WARNING, 
+                    "เชื่อมต่อแต่ไม่ตอบสนอง"
+                )
+        except Exception as e:
+            results["esp32"] = create_device_result(DeviceStatus.ERROR, f"ข้อผิดพลาด: {str(e)}")
+    else:
+        results["esp32"] = create_device_result(
+            DeviceStatus.ERROR,
+            "ไม่ได้เชื่อมต่อ",
+            {"suggestion": "ตรวจสอบสาย USB และ port /dev/ttyUSB0"}
+        )
+    
+    # 2. Camera
+    if robot.camera_connected and robot.detector:
+        try:
+            frame = robot.detector.capture_frame()
+            if frame is not None:
+                h, w = frame.shape[:2]
+                results["camera"] = create_device_result(
+                    DeviceStatus.OK,
+                    f"พร้อมใช้งาน ({w}x{h})"
+                )
+            else:
+                results["camera"] = create_device_result(
+                    DeviceStatus.WARNING,
+                    "เชื่อมต่อแต่ไม่สามารถ capture ได้"
+                )
+        except Exception as e:
+            results["camera"] = create_device_result(DeviceStatus.ERROR, f"ข้อผิดพลาด: {str(e)}")
+    else:
+        results["camera"] = create_device_result(
+            DeviceStatus.ERROR,
+            "ไม่พบกล้อง",
+            {"suggestion": "ตรวจสอบการเชื่อมต่อ USB กล้อง"}
+        )
+    
+    # 3. Motors (ถ้า ESP32 เชื่อมต่อ)
+    if robot.esp32_connected:
+        # Motor Left/Right assumed ready if ESP32 is connected
+        results["motor_left"] = create_device_result(DeviceStatus.OK, "พร้อมใช้งาน")
+        results["motor_right"] = create_device_result(DeviceStatus.OK, "พร้อมใช้งาน")
+        results["motor_z"] = create_device_result(DeviceStatus.OK, "พร้อมใช้งาน (แกน Z)")
+        results["motor_y"] = create_device_result(DeviceStatus.OK, "พร้อมใช้งาน (แกน Y)")
+        results["pump"] = create_device_result(DeviceStatus.OK, "พร้อมใช้งาน")
+        
+        # 4. Ultrasonic Sensors - read actual values
+        try:
+            robot.brain.ser.reset_input_buffer()
+            robot.brain.ser.write(b"US_GET_DIST\n")
+            
+            response = ""
+            timeout = time.time() + 2
+            while time.time() < timeout:
+                if robot.brain.ser.in_waiting > 0:
+                    response = robot.brain.ser.readline().decode().strip()
+                    if response.startswith("DIST:"):
+                        break
+                time.sleep(0.01)
+            
+            if response.startswith("DIST:"):
+                # Parse: DIST:front,yaxis,right
+                values = response[5:].split(",")
+                if len(values) >= 3:
+                    front, yaxis, right = float(values[0]), float(values[1]), float(values[2])
+                    
+                    def us_status(val, name):
+                        if val > 0 and val < 400:
+                            return create_device_result(DeviceStatus.OK, f"{val:.1f} cm")
+                        elif val == 0:
+                            return create_device_result(DeviceStatus.WARNING, "อ่านค่า 0 - อาจต่อผิด")
+                        else:
+                            return create_device_result(DeviceStatus.ERROR, "ค่าผิดปกติ")
+                    
+                    results["ultrasonic_front"] = us_status(front, "หน้า")
+                    results["ultrasonic_y"] = us_status(yaxis, "แกน Y")
+                    results["ultrasonic_right"] = us_status(right, "ขวา")
+                else:
+                    results["ultrasonic_front"] = create_device_result(DeviceStatus.WARNING, "รูปแบบข้อมูลผิด")
+                    results["ultrasonic_y"] = create_device_result(DeviceStatus.WARNING, "รูปแบบข้อมูลผิด")
+                    results["ultrasonic_right"] = create_device_result(DeviceStatus.WARNING, "รูปแบบข้อมูลผิด")
+            else:
+                results["ultrasonic_front"] = create_device_result(DeviceStatus.WARNING, "ไม่ได้รับข้อมูล")
+                results["ultrasonic_y"] = create_device_result(DeviceStatus.WARNING, "ไม่ได้รับข้อมูล")
+                results["ultrasonic_right"] = create_device_result(DeviceStatus.WARNING, "ไม่ได้รับข้อมูล")
+        except Exception as e:
+            results["ultrasonic_front"] = create_device_result(DeviceStatus.ERROR, str(e))
+            results["ultrasonic_y"] = create_device_result(DeviceStatus.ERROR, str(e))
+            results["ultrasonic_right"] = create_device_result(DeviceStatus.ERROR, str(e))
+    else:
+        # ESP32 not connected - all hardware unavailable
+        results["motor_left"] = create_device_result(DeviceStatus.ERROR, "ต้องเชื่อมต่อ ESP32")
+        results["motor_right"] = create_device_result(DeviceStatus.ERROR, "ต้องเชื่อมต่อ ESP32")
+        results["motor_z"] = create_device_result(DeviceStatus.ERROR, "ต้องเชื่อมต่อ ESP32")
+        results["motor_y"] = create_device_result(DeviceStatus.ERROR, "ต้องเชื่อมต่อ ESP32")
+        results["pump"] = create_device_result(DeviceStatus.ERROR, "ต้องเชื่อมต่อ ESP32")
+        results["ultrasonic_front"] = create_device_result(DeviceStatus.ERROR, "ต้องเชื่อมต่อ ESP32")
+        results["ultrasonic_y"] = create_device_result(DeviceStatus.ERROR, "ต้องเชื่อมต่อ ESP32")
+        results["ultrasonic_right"] = create_device_result(DeviceStatus.ERROR, "ต้องเชื่อมต่อ ESP32")
+    
+    # Summary
+    ok_count = sum(1 for r in results.values() if r["status"] == DeviceStatus.OK)
+    warning_count = sum(1 for r in results.values() if r["status"] == DeviceStatus.WARNING)
+    error_count = sum(1 for r in results.values() if r["status"] == DeviceStatus.ERROR)
+    
+    return {
+        "devices": results,
+        "summary": {
+            "ok": ok_count,
+            "warning": warning_count, 
+            "error": error_count,
+            "total": len(results)
+        },
+        "all_ok": error_count == 0 and warning_count == 0,
+        "timestamp": datetime.now().isoformat()
+    }
+
+
+@app.post("/api/health/test/{device}")
+async def test_device(device: str):
+    """
+    POST /api/health/test/{device}
+    ทดสอบอุปกรณ์เฉพาะตัว
+    
+    Devices: motor_left, motor_right, motor_z, motor_y, pump
+    """
+    if not robot.esp32_connected or not robot.brain:
+        return {"success": False, "error": "ESP32 ไม่ได้เชื่อมต่อ"}
+    
+    test_commands = {
+        "motor_left": ("DRIVE_FW", 0.3),   # ทดสอบล้อซ้าย
+        "motor_right": ("DRIVE_FW", 0.3),  # ทดสอบล้อขวา
+        "motor_z": ("ACT:Z_OUT:0.3", 0),   # ยืดแขน 0.3 วินาที
+        "motor_y": ("ACT:Y_UP", 0),        # ยกหัวพ่น
+        "pump": ("ACT:SPRAY:0.2", 0),      # พ่น 0.2 วินาที
+    }
+    
+    if device not in test_commands:
+        return {"success": False, "error": f"ไม่รู้จักอุปกรณ์: {device}"}
+    
+    cmd, after_delay = test_commands[device]
+    
+    try:
+        robot.brain.send_cmd(cmd)
+        if after_delay > 0:
+            time.sleep(after_delay)
+            robot.brain.send_cmd("DRIVE_STOP")
+        
+        return {"success": True, "message": f"ทดสอบ {device} เสร็จสิ้น", "command": cmd}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# ==================== GPIO CONFIGURATION API ====================
+
+@app.get("/api/gpio")
+async def get_gpio_config():
+    """
+    GET /api/gpio
+    อ่านค่า GPIO configuration ปัจจุบันจาก ESP32
+    """
+    if not robot.esp32_connected or not robot.brain:
+        return {"success": False, "error": "ESP32 ไม่ได้เชื่อมต่อ"}
+    
+    try:
+        robot.brain.ser.reset_input_buffer()
+        robot.brain.ser.write(b"GPIO_GET\n")
+        
+        response = ""
+        timeout = time.time() + 2
+        while time.time() < timeout:
+            if robot.brain.ser.in_waiting > 0:
+                line = robot.brain.ser.readline().decode().strip()
+                if line.startswith("GPIO:"):
+                    response = line[5:]  # Remove "GPIO:" prefix
+                    break
+            time.sleep(0.01)
+        
+        if response:
+            import json
+            config = json.loads(response)
+            return {"success": True, "config": config}
+        else:
+            return {"success": False, "error": "ไม่ได้รับข้อมูลจาก ESP32"}
+            
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/gpio/swap/{group}")
+async def swap_gpio_group(group: str):
+    """
+    POST /api/gpio/swap/{group}
+    สลับ GPIO pins ในกลุ่มที่ระบุ
+    
+    Groups: motor_yz, wheels
+    """
+    if not robot.esp32_connected or not robot.brain:
+        return {"success": False, "error": "ESP32 ไม่ได้เชื่อมต่อ"}
+    
+    swap_commands = {
+        "motor_yz": "GPIO_SWAP_MOTOR_YZ",  # สลับ Motor Y <-> Motor Z
+        "wheels": "GPIO_SWAP_WHEELS",       # สลับ Wheel Left <-> Right
+    }
+    
+    if group not in swap_commands:
+        return {"success": False, "error": f"ไม่รู้จักกลุ่ม: {group}. ใช้ได้: motor_yz, wheels"}
+    
+    cmd = swap_commands[group]
+    
+    try:
+        robot.brain.ser.reset_input_buffer()
+        robot.brain.ser.write(f"{cmd}\n".encode())
+        
+        # Wait for response
+        response = ""
+        timeout = time.time() + 3
+        while time.time() < timeout:
+            if robot.brain.ser.in_waiting > 0:
+                line = robot.brain.ser.readline().decode().strip()
+                if line.startswith("GPIO:"):
+                    response = line
+                    break
+                elif line == "DONE":
+                    break
+            time.sleep(0.01)
+        
+        return {
+            "success": True, 
+            "message": f"สลับ {group} สำเร็จ",
+            "note": "ต้อง restart ESP32 เพื่อให้มีผล"
+        }
+        
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/gpio/reset")
+async def reset_gpio_config():
+    """
+    POST /api/gpio/reset
+    Reset GPIO configuration เป็นค่าเริ่มต้น
+    """
+    if not robot.esp32_connected or not robot.brain:
+        return {"success": False, "error": "ESP32 ไม่ได้เชื่อมต่อ"}
+    
+    try:
+        robot.brain.ser.reset_input_buffer()
+        robot.brain.ser.write(b"GPIO_RESET\n")
+        
+        # Wait for DONE
+        timeout = time.time() + 3
+        while time.time() < timeout:
+            if robot.brain.ser.in_waiting > 0:
+                line = robot.brain.ser.readline().decode().strip()
+                if line == "DONE":
+                    break
+            time.sleep(0.01)
+        
+        return {
+            "success": True,
+            "message": "Reset GPIO config เป็นค่าเริ่มต้นสำเร็จ",
+            "note": "ต้อง restart ESP32 เพื่อให้มีผล"
+        }
+        
+    except Exception as e:
         return {"success": False, "error": str(e)}
 
 

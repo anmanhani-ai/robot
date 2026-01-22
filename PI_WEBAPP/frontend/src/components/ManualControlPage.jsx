@@ -1,15 +1,15 @@
 /**
  * ManualControlPage.jsx
  * หน้าควบคุมหุ่นยนต์แบบ Manual
- * - เดินหน้า/ถอยหลัง/เลี้ยว
+ * - เดินหน้า/ถอยหลัง
  * - ควบคุมแขนกล Z (ยืด/หด)
  * - ควบคุมหัวพ่น Y (ขึ้น/ลง)
  * - พ่นยา
  */
 
 import { useState, useCallback, useEffect } from 'react';
-import { 
-  ArrowUp, ArrowDown, ArrowLeft, ArrowRight, 
+import {
+  ArrowUp, ArrowDown,
   Square, Droplets, Minus, Plus,
   ChevronUp, ChevronDown, ChevronLeft, ChevronRight,
   Gamepad2, AlertTriangle, RefreshCw
@@ -38,10 +38,11 @@ export default function ManualControlPage({ onBack }) {
   const [lastResult, setLastResult] = useState(null);
   const [sprayDuration, setSprayDuration] = useState(1.0);
   const [armDuration, setArmDuration] = useState(1.0);
+  const [moveDuration, setMoveDuration] = useState(1.0); // เวลาเดินหน้า/ถอยหลัง
   const [isConnected, setIsConnected] = useState(true);
 
   // ==================== Movement Commands ====================
-  
+
   const handleMoveStart = async (direction) => {
     setIsMoving(true);
     setCurrentAction(direction);
@@ -61,6 +62,26 @@ export default function ManualControlPage({ onBack }) {
       setLastResult(result);
     } catch (err) {
       setLastResult({ success: false, error: err.message });
+    }
+  };
+
+  // ==================== Timed Movement Commands ====================
+
+  const handleTimedMove = async (direction) => {
+    setIsMoving(true);
+    setCurrentAction(direction);
+    try {
+      // ส่งคำสั่งเคลื่อนที่พร้อมเวลา
+      const cmd = direction === 'FORWARD'
+        ? `MOVE_FW:${moveDuration}`
+        : `MOVE_BW:${moveDuration}`;
+      const result = await sendManualCommand(cmd);
+      setLastResult(result);
+    } catch (err) {
+      setLastResult({ success: false, error: err.message });
+    } finally {
+      setIsMoving(false);
+      setCurrentAction(null);
     }
   };
 
@@ -84,7 +105,8 @@ export default function ManualControlPage({ onBack }) {
   const handleArmY = async (action) => {
     setCurrentAction(`ARM_Y_${action}`);
     try {
-      const cmd = action === 'UP' ? 'ACT:Y_UP' : 'ACT:Y_DOWN';
+      // ใช้ Y_UP:<seconds> และ Y_DOWN:<seconds> เพื่อให้ตั้งเวลาได้
+      const cmd = action === 'UP' ? `Y_UP:${armDuration}` : `Y_DOWN:${armDuration}`;
       const result = await sendManualCommand(cmd);
       setLastResult(result);
     } catch (err) {
@@ -126,7 +148,7 @@ export default function ManualControlPage({ onBack }) {
   useEffect(() => {
     const handleKeyDown = (e) => {
       if (e.target.tagName === 'INPUT') return;
-      
+
       switch (e.key.toLowerCase()) {
         case 'w':
         case 'arrowup':
@@ -135,14 +157,6 @@ export default function ManualControlPage({ onBack }) {
         case 's':
         case 'arrowdown':
           if (!isMoving) handleMoveStart('BACKWARD');
-          break;
-        case 'a':
-        case 'arrowleft':
-          if (!isMoving) handleMoveStart('LEFT');
-          break;
-        case 'd':
-        case 'arrowright':
-          if (!isMoving) handleMoveStart('RIGHT');
           break;
         case ' ':
           e.preventDefault();
@@ -155,14 +169,14 @@ export default function ManualControlPage({ onBack }) {
     };
 
     const handleKeyUp = (e) => {
-      if (['w', 's', 'a', 'd', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(e.key.toLowerCase())) {
+      if (['w', 's', 'arrowup', 'arrowdown'].includes(e.key.toLowerCase())) {
         handleMoveStop();
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     window.addEventListener('keyup', handleKeyUp);
-    
+
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
@@ -181,8 +195,8 @@ export default function ManualControlPage({ onBack }) {
       className={`
         p-4 rounded-xl font-medium transition-all duration-150
         flex flex-col items-center justify-center gap-2
-        ${active 
-          ? 'bg-primary-500 text-white scale-95 shadow-lg shadow-primary-500/30' 
+        ${active
+          ? 'bg-primary-500 text-white scale-95 shadow-lg shadow-primary-500/30'
           : danger
             ? 'bg-red-500/20 text-red-400 hover:bg-red-500 hover:text-white'
             : 'bg-gray-700/50 text-gray-300 hover:bg-gray-600 hover:text-white'
@@ -210,7 +224,7 @@ export default function ManualControlPage({ onBack }) {
             <p className="text-sm text-gray-400">ควบคุมหุ่นยนต์ด้วยตัวเอง</p>
           </div>
         </div>
-        
+
         <button
           onClick={onBack}
           className="px-4 py-2 rounded-lg bg-gray-700 text-gray-300 hover:bg-gray-600 transition-colors"
@@ -222,21 +236,66 @@ export default function ManualControlPage({ onBack }) {
       {/* Keyboard Hint */}
       <div className="bg-blue-500/10 border border-blue-500/30 rounded-xl p-4">
         <p className="text-blue-400 text-sm">
-          💡 <strong>ใช้คีย์บอร์ดควบคุมได้:</strong> W/A/S/D หรือ ลูกศร = เคลื่อนที่ | Space = หยุด | ESC = หยุดฉุกเฉิน
+          💡 <strong>ใช้คีย์บอร์ดควบคุมได้:</strong> W/S หรือ ↑/↓ = เดินหน้า/ถอย | Space = หยุด | ESC = หยุดฉุกเฉิน
         </p>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        
+
         {/* Movement Controls */}
         <div className="bg-gray-800/50 backdrop-blur rounded-2xl border border-gray-700/50 p-6">
           <h3 className="text-lg font-semibold text-white mb-4 flex items-center gap-2">
             🚗 ควบคุมการเคลื่อนที่
           </h3>
-          
-          <div className="grid grid-cols-3 gap-3 max-w-[200px] mx-auto">
-            {/* Row 1 */}
-            <div></div>
+
+          {/* Duration Setting */}
+          <div className="flex items-center gap-4 mb-4">
+            <span className="text-gray-400 text-sm">เวลา:</span>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setMoveDuration(Math.max(0.5, moveDuration - 0.5))}
+                className="p-2 bg-gray-700 rounded-lg hover:bg-gray-600"
+              >
+                <Minus className="w-4 h-4 text-gray-300" />
+              </button>
+              <span className="text-white font-mono w-16 text-center">{moveDuration.toFixed(1)}s</span>
+              <button
+                onClick={() => setMoveDuration(Math.min(10, moveDuration + 0.5))}
+                className="p-2 bg-gray-700 rounded-lg hover:bg-gray-600"
+              >
+                <Plus className="w-4 h-4 text-gray-300" />
+              </button>
+            </div>
+          </div>
+
+          {/* Timed Movement Buttons */}
+          <div className="grid grid-cols-2 gap-3 mb-4">
+            <button
+              onClick={() => handleTimedMove('FORWARD')}
+              disabled={isMoving}
+              className={`py-3 px-4 rounded-xl font-medium transition-all flex items-center justify-center gap-2
+                ${currentAction === 'FORWARD' ? 'bg-green-500 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}
+                ${isMoving ? 'opacity-50' : ''}`}
+            >
+              <ArrowUp className="w-5 h-5" />
+              หน้า {moveDuration}s
+            </button>
+            <button
+              onClick={() => handleTimedMove('BACKWARD')}
+              disabled={isMoving}
+              className={`py-3 px-4 rounded-xl font-medium transition-all flex items-center justify-center gap-2
+                ${currentAction === 'BACKWARD' ? 'bg-green-500 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}
+                ${isMoving ? 'opacity-50' : ''}`}
+            >
+              <ArrowDown className="w-5 h-5" />
+              ถอย {moveDuration}s
+            </button>
+          </div>
+
+          {/* Continuous Movement (Press & Hold) */}
+          <p className="text-gray-500 text-xs mb-2">กดค้าง (Continuous):</p>
+          <div className="flex flex-col items-center gap-3 max-w-[80px] mx-auto">
+            {/* เดินหน้า */}
             <ControlButton
               icon={ArrowUp}
               label="หน้า"
@@ -244,16 +303,8 @@ export default function ManualControlPage({ onBack }) {
               onMouseDown={() => handleMoveStart('FORWARD')}
               onMouseUp={handleMoveStop}
             />
-            <div></div>
-            
-            {/* Row 2 */}
-            <ControlButton
-              icon={ArrowLeft}
-              label="ซ้าย"
-              active={currentAction === 'LEFT'}
-              onMouseDown={() => handleMoveStart('LEFT')}
-              onMouseUp={handleMoveStop}
-            />
+
+            {/* หยุด */}
             <ControlButton
               icon={Square}
               label="หยุด"
@@ -261,16 +312,8 @@ export default function ManualControlPage({ onBack }) {
               onClick={handleMoveStop}
               className="bg-yellow-500/20 text-yellow-400 hover:bg-yellow-500 hover:text-white"
             />
-            <ControlButton
-              icon={ArrowRight}
-              label="ขวา"
-              active={currentAction === 'RIGHT'}
-              onMouseDown={() => handleMoveStart('RIGHT')}
-              onMouseUp={handleMoveStop}
-            />
-            
-            {/* Row 3 */}
-            <div></div>
+
+            {/* ถอยหลัง */}
             <ControlButton
               icon={ArrowDown}
               label="ถอย"
@@ -278,7 +321,6 @@ export default function ManualControlPage({ onBack }) {
               onMouseDown={() => handleMoveStart('BACKWARD')}
               onMouseUp={handleMoveStop}
             />
-            <div></div>
           </div>
         </div>
 
@@ -293,14 +335,14 @@ export default function ManualControlPage({ onBack }) {
             <div className="flex items-center gap-4">
               <span className="text-gray-400 text-sm">เวลา:</span>
               <div className="flex items-center gap-2">
-                <button 
+                <button
                   onClick={() => setArmDuration(Math.max(0.5, armDuration - 0.5))}
                   className="p-2 bg-gray-700 rounded-lg hover:bg-gray-600"
                 >
                   <Minus className="w-4 h-4 text-gray-300" />
                 </button>
                 <span className="text-white font-mono w-16 text-center">{armDuration.toFixed(1)}s</span>
-                <button 
+                <button
                   onClick={() => setArmDuration(Math.min(5, armDuration + 0.5))}
                   className="p-2 bg-gray-700 rounded-lg hover:bg-gray-600"
                 >
@@ -317,8 +359,8 @@ export default function ManualControlPage({ onBack }) {
                   onClick={() => handleArmZ('OUT')}
                   disabled={currentAction !== null}
                   className={`flex-1 py-3 px-4 rounded-xl font-medium transition-all
-                    ${currentAction === 'ARM_Z_OUT' 
-                      ? 'bg-blue-500 text-white' 
+                    ${currentAction === 'ARM_Z_OUT'
+                      ? 'bg-blue-500 text-white'
                       : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}
                     flex items-center justify-center gap-2
                   `}
@@ -330,8 +372,8 @@ export default function ManualControlPage({ onBack }) {
                   onClick={() => handleArmZ('IN')}
                   disabled={currentAction !== null}
                   className={`flex-1 py-3 px-4 rounded-xl font-medium transition-all
-                    ${currentAction === 'ARM_Z_IN' 
-                      ? 'bg-blue-500 text-white' 
+                    ${currentAction === 'ARM_Z_IN'
+                      ? 'bg-blue-500 text-white'
                       : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}
                     flex items-center justify-center gap-2
                   `}
@@ -350,8 +392,8 @@ export default function ManualControlPage({ onBack }) {
                   onClick={() => handleArmY('UP')}
                   disabled={currentAction !== null}
                   className={`flex-1 py-3 px-4 rounded-xl font-medium transition-all
-                    ${currentAction === 'ARM_Y_UP' 
-                      ? 'bg-cyan-500 text-white' 
+                    ${currentAction === 'ARM_Y_UP'
+                      ? 'bg-cyan-500 text-white'
                       : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}
                     flex items-center justify-center gap-2
                   `}
@@ -363,8 +405,8 @@ export default function ManualControlPage({ onBack }) {
                   onClick={() => handleArmY('DOWN')}
                   disabled={currentAction !== null}
                   className={`flex-1 py-3 px-4 rounded-xl font-medium transition-all
-                    ${currentAction === 'ARM_Y_DOWN' 
-                      ? 'bg-cyan-500 text-white' 
+                    ${currentAction === 'ARM_Y_DOWN'
+                      ? 'bg-cyan-500 text-white'
                       : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}
                     flex items-center justify-center gap-2
                   `}
@@ -388,14 +430,14 @@ export default function ManualControlPage({ onBack }) {
             <div className="flex items-center gap-4">
               <span className="text-gray-400 text-sm">เวลาพ่น:</span>
               <div className="flex items-center gap-2">
-                <button 
+                <button
                   onClick={() => setSprayDuration(Math.max(0.5, sprayDuration - 0.5))}
                   className="p-2 bg-gray-700 rounded-lg hover:bg-gray-600"
                 >
                   <Minus className="w-4 h-4 text-gray-300" />
                 </button>
                 <span className="text-white font-mono w-16 text-center">{sprayDuration.toFixed(1)}s</span>
-                <button 
+                <button
                   onClick={() => setSprayDuration(Math.min(10, sprayDuration + 0.5))}
                   className="p-2 bg-gray-700 rounded-lg hover:bg-gray-600"
                 >
@@ -448,8 +490,8 @@ export default function ManualControlPage({ onBack }) {
       {lastResult && (
         <div className={`p-4 rounded-xl ${lastResult.success !== false ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>
           <p className="text-sm">
-            {lastResult.success !== false 
-              ? `✅ ${lastResult.message || 'คำสั่งสำเร็จ'}` 
+            {lastResult.success !== false
+              ? `✅ ${lastResult.message || 'คำสั่งสำเร็จ'}`
               : `❌ ${lastResult.error || 'เกิดข้อผิดพลาด'}`
             }
           </p>

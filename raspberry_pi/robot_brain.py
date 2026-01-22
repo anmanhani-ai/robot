@@ -17,6 +17,21 @@ from typing import Tuple, Optional
 from dataclasses import dataclass, field
 from enum import Enum
 
+# Import custom exceptions
+try:
+    from exceptions import (
+        RobotConnectionError, 
+        CommandTimeoutError, 
+        EmergencyStopError,
+        CalibrationError
+    )
+except ImportError:
+    # Fallback if exceptions.py not found
+    RobotConnectionError = ConnectionError
+    CommandTimeoutError = TimeoutError
+    EmergencyStopError = RuntimeError
+    CalibrationError = ValueError
+
 # ==================== LOGGING SETUP ====================
 logging.basicConfig(
     level=logging.INFO,
@@ -58,11 +73,17 @@ class CalibrationConfig:
     img_height: int = 480
     
     # === Z-Axis Calibration (แขนยืด) ===
-    arm_speed_cm_per_sec: float = 10.0      # ความเร็วแขน (cm/s)
+    arm_speed_cm_per_sec: float = 10.0      # ความเร็วแขน Z (cm/s)
     pixel_to_cm_z: float = 0.05             # 1 pixel = กี่ cm (แกน Z)
     arm_base_offset_cm: float = 5.0         # ระยะจากแกนกลางถึงจุดเริ่มยืดแขน
     max_arm_extend_time: float = 5.0        # เวลาสูงสุดที่ยืดได้ (วินาที)
     arm_retract_buffer: float = 0.5         # เวลาเพิ่มเติมตอนหด (วินาที)
+    arm_z_default_cm: float = 0.0           # ตำแหน่ง default Z (cm)
+    
+    # === Y-Axis Calibration (Motor DC ขึ้น/ลง) ===
+    motor_y_speed_cm_per_sec: float = 5.0   # ความเร็วแขน Y (cm/s)
+    motor_y_default_cm: float = 0.0         # ตำแหน่ง default Y (cm จากบนสุด)
+    motor_y_max_cm: float = 20.0            # ระยะเคลื่อนที่ Y สูงสุด (cm)
     
     # === X-Axis Calibration (ล้อ) ===
     wheel_speed_cm_per_sec: float = 20.0    # ความเร็วล้อ (cm/s)  
@@ -106,6 +127,17 @@ class CalibrationConfig:
                     # แปลง max_arm_extend_cm เป็น max_arm_extend_time
                     max_cm = data['max_arm_extend_cm']
                     config.max_arm_extend_time = max_cm / config.arm_speed_cm_per_sec
+                if 'arm_z_default_cm' in data:
+                    config.arm_z_default_cm = data['arm_z_default_cm']
+                    
+                # Motor Y settings
+                if 'motor_y_speed_cm_per_sec' in data:
+                    config.motor_y_speed_cm_per_sec = data['motor_y_speed_cm_per_sec']
+                if 'motor_y_default_cm' in data:
+                    config.motor_y_default_cm = data['motor_y_default_cm']
+                if 'motor_y_max_cm' in data:
+                    config.motor_y_max_cm = data['motor_y_max_cm']
+                    
                 if 'alignment_tolerance_px' in data:
                     config.alignment_tolerance_px = data['alignment_tolerance_px']
                 if 'default_spray_duration' in data:
@@ -115,10 +147,17 @@ class CalibrationConfig:
                 if 'img_height' in data:
                     config.img_height = data['img_height']
                 
+                # Serial configuration
+                if 'serial_port' in data:
+                    config.serial_port = data['serial_port']
+                if 'baud_rate' in data:
+                    config.baud_rate = data['baud_rate']
+                if 'timeout' in data:
+                    config.timeout = data['timeout']
+                
                 logger.info(f"✅ Loaded calibration from {filepath}")
-                logger.info(f"   pixel_to_cm_z = {config.pixel_to_cm_z:.6f}")
-                logger.info(f"   arm_speed = {config.arm_speed_cm_per_sec:.2f} cm/s")
-                logger.info(f"   arm_offset = {config.arm_base_offset_cm:.2f} cm")
+                logger.info(f"   Z speed: {config.arm_speed_cm_per_sec:.2f} cm/s, default: {config.arm_z_default_cm:.1f} cm")
+                logger.info(f"   Y speed: {config.motor_y_speed_cm_per_sec:.2f} cm/s, default: {config.motor_y_default_cm:.1f} cm")
                 
             except Exception as e:
                 logger.warning(f"⚠️ Failed to load calibration: {e}")
@@ -185,7 +224,14 @@ class RobotBrain:
             self.ser.write(b"PING\n")
             response = self.ser.readline().decode().strip()
             return response == "PONG"
-        except:
+        except serial.SerialException as e:
+            logger.error(f"Serial error in connection check: {e}")
+            return False
+        except UnicodeDecodeError as e:
+            logger.warning(f"Decode error in connection check: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error in connection check: {e}")
             return False
     
     # ==================== SERIAL COMMUNICATION ====================
@@ -272,24 +318,62 @@ class RobotBrain:
         
         return time_seconds, actual_distance
     
-    def calculate_x_movement(self, distance_from_center_px: int) -> Tuple[str, float]:
+    # ==================== NEW COORDINATE SYSTEM ====================
+    # Origin (0,0) at bottom center (pixel 320, 480)
+    # X-axis: left(-) ← 0 → right(+) = robot direction
+    # Y-axis: 0 → up(+) only (no negative Y)
+    # ================================================================
+    
+    def calculate_coord_x_movement(self, coord_x: int) -> Tuple[str, float]:
         """
-        คำนวณทิศทางและเวลาเคลื่อนที่แกน X (ล้อ)
+        คำนวณการเคลื่อนที่ตาม X ในระบบพิกัดใหม่
         
         Args:
-            distance_from_center_px: ระยะห่างจากแกนกลาง (pixel, บวก=ขวา, ลบ=ซ้าย)
+            coord_x: พิกัด X (X+ = ขวา = Forward, X- = ซ้าย = Backward)
             
         Returns:
-            Tuple[str, float]: (ทิศทาง "FW"/"BW", เวลา_วินาที)
+            Tuple[str, float]: (ทิศทาง 'FW'/'BW', เวลา_วินาที)
         """
-        # แปลง pixel เป็น cm
-        distance_cm = abs(distance_from_center_px) * self.config.pixel_to_cm_x
-        
-        # คำนวณเวลา
+        direction = "FW" if coord_x > 0 else "BW"
+        distance_cm = abs(coord_x) * self.config.pixel_to_cm_x
         time_seconds = distance_cm / self.config.wheel_speed_cm_per_sec
         
-        # กำหนดทิศทาง (ปรับตามการติดตั้งกล้อง)
+        logger.debug(f"Coord X: {coord_x}px → {direction} {distance_cm:.1f}cm → {time_seconds:.2f}s")
+        
+        return direction, time_seconds
+    
+    def calculate_y_from_bottom(self, bottom_y_px: int) -> Tuple[float, float]:
+        """
+        คำนวณระยะ Y จากขอบล่างของภาพถึงขอบล่างของวัตถุ
+        
+        Args:
+            bottom_y_px: ระยะ pixel จากขอบล่างภาพถึงขอบล่างวัตถุ
+            
+        Returns:
+            Tuple[float, float]: (ระยะ_cm, เวลา_วินาที at 2.17 cm/s)
+        """
+        distance_cm = bottom_y_px * self.config.pixel_to_cm_z
+        time_seconds = distance_cm / self.config.arm_speed_cm_per_sec
+        
+        logger.debug(f"Y from bottom: {bottom_y_px}px → {distance_cm:.1f}cm → {time_seconds:.2f}s")
+        
+        return distance_cm, time_seconds
+    
+    def calculate_x_movement(self, distance_from_center_px: int) -> Tuple[str, float]:
+        """
+        คำนวณการเคลื่อนที่ X-Axis (legacy - ยังใช้ได้)
+        
+        Args:
+            distance_from_center_px: ระยะห่างจากจุดกลาง (pixel)
+            
+        Returns:
+            Tuple[str, float]: (ทิศทาง 'FW'/'BW', เวลา_วินาที)
+        """
         direction = "FW" if distance_from_center_px > 0 else "BW"
+        distance_cm = abs(distance_from_center_px) * self.config.pixel_to_cm_x
+        time_seconds = distance_cm / self.config.wheel_speed_cm_per_sec
+        
+        logger.debug(f"X-Calc: {distance_from_center_px}px → {direction} {distance_cm:.1f}cm → {time_seconds:.2f}s")
         
         return direction, time_seconds
     
@@ -326,79 +410,69 @@ class RobotBrain:
     
     # ==================== MOVEMENT OPERATIONS ====================
     
-    # Speed constants (PWM 0-255)
-    SPEED_MAX = 200       # ความเร็วสูงสุด (ไม่ใช้ 255 เพื่อไม่ให้แรงเกิน)
-    SPEED_NORMAL = 150    # ความเร็วปกติ
-    SPEED_SLOW = 80       # ความเร็วต่ำ (เมื่อใกล้ target)
-    SPEED_CREEP = 50      # ความเร็วคืบ (ใกล้มาก)
+    # Speed constants (PWM 0-255) - ตรงกับ ESP32 dual_motor.h
+    SPEED_MAX = 60        # ความเร็วสูงสุด (สำหรับ auto mode)
+    SPEED_NORMAL = 40     # ความเร็วปกติ (ตรงกับ MOTOR_DEFAULT_SPEED)
+    SPEED_SLOW = 30       # ความเร็วต่ำ (เมื่อใกล้ target)
+    SPEED_CREEP = 25      # ความเร็วคืบ (ใกล้มาก)
     
     def move_forward(self) -> bool:
         """รถเดินหน้า (ความเร็วปกติ)"""
         self.state = RobotState.SEARCHING
-        return self.send_cmd("MOVE_FORWARD")
+        return self.send_cmd("MOVE_FORWARD", wait_for_done=False)
     
     def move_forward_speed(self, speed: int) -> bool:
         """รถเดินหน้าด้วยความเร็วที่กำหนด (0-255)"""
         self.state = RobotState.SEARCHING
-        return self.send_cmd(f"MOVE_FW:{speed}")
+        return self.send_cmd(f"MOVE_FW:{speed}", wait_for_done=False)
     
     def move_backward(self) -> bool:
         """รถถอยหลัง (ความเร็วปกติ)"""
-        return self.send_cmd("MOVE_BACKWARD")
+        return self.send_cmd("MOVE_BACKWARD", wait_for_done=False)
     
     def move_backward_speed(self, speed: int) -> bool:
         """รถถอยหลังด้วยความเร็วที่กำหนด (0-255)"""
-        return self.send_cmd(f"MOVE_BW:{speed}")
+        return self.send_cmd(f"MOVE_BW:{speed}", wait_for_done=False)
     
     def set_speed(self, speed: int) -> bool:
         """ปรับความเร็วขณะวิ่ง (0-255)"""
-        return self.send_cmd(f"MOVE_SET_SPEED:{speed}")
+        return self.send_cmd(f"MOVE_SET_SPEED:{speed}", wait_for_done=False)
     
     def stop_movement(self) -> bool:
         """หยุดรถ"""
         return self.send_cmd("MOVE_STOP")
-    
-    def calculate_approach_speed(self, distance_from_center_px: int) -> int:
-        """
-        คำนวณความเร็วตามระยะห่างจาก target
-        ยิ่งใกล้ → ยิ่งช้า (Smooth approach)
-        
-        Args:
-            distance_from_center_px: ระยะห่างจากแกนกลาง (pixel)
-            
-        Returns:
-            int: ความเร็ว PWM (0-255)
-        """
-        dist = abs(distance_from_center_px)
-        
-        # Zone definitions (ปรับได้ตามต้องการ)
-        FAR_ZONE = 200     # ไกลมาก → เร็วเต็มที่
-        MID_ZONE = 100     # กลาง → ความเร็วปกติ
-        NEAR_ZONE = 50     # ใกล้ → ช้าลง
-        ALIGN_ZONE = self.config.alignment_tolerance_px  # ใกล้มาก → หยุด
-        
-        if dist > FAR_ZONE:
-            return self.SPEED_MAX
-        elif dist > MID_ZONE:
-            # Linear interpolation: MAX → NORMAL
-            ratio = (dist - MID_ZONE) / (FAR_ZONE - MID_ZONE)
-            return int(self.SPEED_NORMAL + ratio * (self.SPEED_MAX - self.SPEED_NORMAL))
-        elif dist > NEAR_ZONE:
-            # Linear interpolation: NORMAL → SLOW
-            ratio = (dist - NEAR_ZONE) / (MID_ZONE - NEAR_ZONE)
-            return int(self.SPEED_SLOW + ratio * (self.SPEED_NORMAL - self.SPEED_SLOW))
-        elif dist > ALIGN_ZONE:
-            # SLOW → CREEP
-            ratio = (dist - ALIGN_ZONE) / (NEAR_ZONE - ALIGN_ZONE)
-            return int(self.SPEED_CREEP + ratio * (self.SPEED_SLOW - self.SPEED_CREEP))
-        else:
-            return 0  # หยุด
     
     def emergency_stop(self) -> bool:
         """หยุดฉุกเฉินทุกระบบ"""
         self.state = RobotState.IDLE
         logger.warning("⚠️ EMERGENCY STOP!")
         return self.send_cmd("STOP_ALL")
+    
+    def calculate_approach_speed(self, distance_from_center_px: int) -> int:
+        """
+        คำนวณความเร็วตามระยะห่างจาก target
+        ยิ่งใกล้ → ยิ่งช้า (Smooth approach)
+        """
+        dist = abs(distance_from_center_px)
+        
+        FAR_ZONE = 200
+        MID_ZONE = 100
+        NEAR_ZONE = 50
+        ALIGN_ZONE = self.config.alignment_tolerance_px
+        
+        if dist > FAR_ZONE:
+            return self.SPEED_MAX
+        elif dist > MID_ZONE:
+            ratio = (dist - MID_ZONE) / (FAR_ZONE - MID_ZONE)
+            return int(self.SPEED_NORMAL + ratio * (self.SPEED_MAX - self.SPEED_NORMAL))
+        elif dist > NEAR_ZONE:
+            ratio = (dist - NEAR_ZONE) / (MID_ZONE - NEAR_ZONE)
+            return int(self.SPEED_SLOW + ratio * (self.SPEED_NORMAL - self.SPEED_SLOW))
+        elif dist > ALIGN_ZONE:
+            ratio = (dist - ALIGN_ZONE) / (NEAR_ZONE - ALIGN_ZONE)
+            return int(self.SPEED_CREEP + ratio * (self.SPEED_SLOW - self.SPEED_CREEP))
+        else:
+            return 0
     
     # ==================== MISSION EXECUTION ====================
     
@@ -410,106 +484,51 @@ class RobotBrain:
         """
         ปฏิบัติการพ่นยาแบบ Distance-Based
         
-        Flow ตาม Step-by-Step:
+        Flow:
         1. คำนวณเวลายืดจากระยะ pixel
         2. ยืดแขน Z
         3. หัวฉีดลง Y
         4. พ่นยา
         5. หัวฉีดขึ้น Y
         6. หดแขน Z
-        
-        Args:
-            distance_from_center_px: ระยะห่างจากแกนกลาง (pixel)
-            spray_duration: เวลาพ่น (วินาที)
-            
-        Returns:
-            bool: True ถ้าสำเร็จทุกขั้นตอน
         """
-        # === คำนวณฟิสิกส์ ===
+        # คำนวณฟิสิกส์
         t_move, distance_cm = self.calculate_z_distance(distance_from_center_px)
         logger.info(f"🎯 Target: {distance_cm:.1f}cm | Move Time: {t_move:.2f}s")
         
         if t_move <= 0:
             logger.warning("⚠️ Target too close, skipping extension")
-            t_move = 0.1  # minimum extend
+            t_move = 0.1
         
-        # === Step 3.1: ยืดแขน Z ===
+        # Step 1: ยืดแขน Z
         self.state = RobotState.EXTENDING
         if not self.extend_arm(t_move):
-            logger.error("❌ Failed at Step 3.1: Extend Arm")
+            logger.error("❌ Failed: Extend Arm")
             return False
         
-        # === Step 3.2: หัวฉีดลง Y ===
+        # Step 2: หัวฉีดลง Y
         if not self.lower_spray_head():
-            logger.error("❌ Failed at Step 3.2: Lower Head")
+            logger.error("❌ Failed: Lower Head")
             return False
         
-        # === Step 3.3: พ่นยา ===
+        # Step 3: พ่นยา
         self.state = RobotState.SPRAYING
         if not self.spray(spray_duration):
-            logger.error("❌ Failed at Step 3.3: Spray")
+            logger.error("❌ Failed: Spray")
             return False
         
-        # === Step 4.1: หัวฉีดขึ้น Y (ก่อนหดแขน!) ===
+        # Step 4: หัวฉีดขึ้น Y
         if not self.raise_spray_head():
-            logger.error("❌ Failed at Step 4.1: Raise Head")
+            logger.error("❌ Failed: Raise Head")
             return False
         
-        # === Step 4.2: หดแขน Z ===
+        # Step 5: หดแขน Z
         self.state = RobotState.RETRACTING
         if not self.retract_arm(t_move):
-            logger.error("❌ Failed at Step 4.2: Retract Arm")
+            logger.error("❌ Failed: Retract Arm")
             return False
         
         self.state = RobotState.IDLE
         logger.info("✨ Spray Mission Complete!")
         return True
-    
-    def align_to_target(self, distance_from_center_px: int) -> bool:
-        """
-        จัดตำแหน่งรถให้ target อยู่ตรงกลาง (X-Axis)
-        
-        Args:
-            distance_from_center_px: ระยะห่างจากแกนกลาง (pixel)
-            
-        Returns:
-            bool: True ถ้า aligned สำเร็จ
-        """
-        if self.is_aligned(distance_from_center_px):
-            logger.info("✓ Already aligned")
-            return True
-        
-        self.state = RobotState.ALIGNING
-        direction, move_time = self.calculate_x_movement(distance_from_center_px)
-        
-        logger.info(f"↔️ Aligning: {direction} for {move_time:.2f}s")
-        
-        # เคลื่อนที่
-        cmd = f"MOVE_X:{direction}"
-        if not self.send_cmd(cmd):
-            return False
-        
-        time.sleep(move_time)
-        
-        # หยุด
-        return self.stop_movement()
 
-
-# ==================== MAIN EXECUTION ====================
-if __name__ == "__main__":
-    # ทดสอบ
-    config = CalibrationConfig()
-    bot = RobotBrain(config)
-    
-    if bot.connect():
-        # สมมติ AI ตรวจพบหญ้าห่างจากแกนกลาง 100 pixel
-        distance_px = 100
-        
-        # คำนวณ
-        t, d = bot.calculate_z_distance(distance_px)
-        print(f"Distance: {distance_px}px → {d:.1f}cm → {t:.2f}s")
-        
-        # ปฏิบัติการ
-        bot.execute_spray_mission(distance_px)
-        
-        bot.disconnect()

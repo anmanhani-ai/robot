@@ -21,8 +21,8 @@ void DualMotorController::init() {
     pinMode(PIN_MOTOR_L_IN2, OUTPUT);
     
     // Setup pins - Motor Right (ใช้ PWM โดยตรง)
-    pinMode(PIN_MOTOR_R_IN1, OUTPUT);
-    pinMode(PIN_MOTOR_R_IN2, OUTPUT);
+    pinMode(PIN_MOTOR_R_IN3, OUTPUT);
+    pinMode(PIN_MOTOR_R_IN4, OUTPUT);
     
     // Stop motors
     stop();
@@ -33,8 +33,8 @@ void DualMotorController::init() {
     Serial.println("✅ Dual Motor initialized (4-pin driver)");
     Serial.println("   Left:  IN1=GPIO" + String(PIN_MOTOR_L_IN1) + 
                    ", IN2=GPIO" + String(PIN_MOTOR_L_IN2));
-    Serial.println("   Right: IN1=GPIO" + String(PIN_MOTOR_R_IN1) + 
-                   ", IN2=GPIO" + String(PIN_MOTOR_R_IN2));
+    Serial.println("   Right: IN3=GPIO" + String(PIN_MOTOR_R_IN3) + 
+                   ", IN4=GPIO" + String(PIN_MOTOR_R_IN4));
     Serial.println("   Trim:  " + String(trimOffset));
 }
 
@@ -65,8 +65,8 @@ void DualMotorController::emergencyStop() {
     // หยุดทันที - ทุก pin เป็น LOW
     analogWrite(PIN_MOTOR_L_IN1, 0);
     analogWrite(PIN_MOTOR_L_IN2, 0);
-    analogWrite(PIN_MOTOR_R_IN1, 0);
-    analogWrite(PIN_MOTOR_R_IN2, 0);
+    analogWrite(PIN_MOTOR_R_IN3, 0);
+    analogWrite(PIN_MOTOR_R_IN4, 0);
     
     Serial.println("🛑 Emergency Stop!");
 }
@@ -165,17 +165,17 @@ void DualMotorController::setMotorR(int speed) {
     absSpeed = constrain(absSpeed, 0, 255);
     
     if (speed > 0) {
-        // หน้า: IN1 = PWM, IN2 = 0
-        analogWrite(PIN_MOTOR_R_IN1, absSpeed);
-        analogWrite(PIN_MOTOR_R_IN2, 0);
+        // หน้า: IN3 = PWM, IN4 = 0
+        analogWrite(PIN_MOTOR_R_IN3, absSpeed);
+        analogWrite(PIN_MOTOR_R_IN4, 0);
     } else if (speed < 0) {
-        // ถอย: IN1 = 0, IN2 = PWM
-        analogWrite(PIN_MOTOR_R_IN1, 0);
-        analogWrite(PIN_MOTOR_R_IN2, absSpeed);
+        // ถอย: IN3 = 0, IN4 = PWM
+        analogWrite(PIN_MOTOR_R_IN3, 0);
+        analogWrite(PIN_MOTOR_R_IN4, absSpeed);
     } else {
         // หยุด: ทั้งคู่ = 0
-        analogWrite(PIN_MOTOR_R_IN1, 0);
-        analogWrite(PIN_MOTOR_R_IN2, 0);
+        analogWrite(PIN_MOTOR_R_IN3, 0);
+        analogWrite(PIN_MOTOR_R_IN4, 0);
     }
 }
 

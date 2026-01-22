@@ -163,14 +163,15 @@ void CommandHandler::processCommand(String command) {
     // ==================== ULTRASONIC COMMANDS ====================
     else if (command == "US_GET_DIST") {
         float front = ultrasonics.getFrontDistance();
-        float yAxis = ultrasonics.getYDistance();
         float right = ultrasonics.getRightDistance();
+        float yAxis = ultrasonics.getYDistance();
+        // Format: DIST:front,right,y (ตรงกับ sendDistancesToSerial)
         Serial.print("DIST:");
         Serial.print(front, 1);
         Serial.print(",");
-        Serial.print(yAxis, 1);
+        Serial.print(right, 1);
         Serial.print(",");
-        Serial.println(right, 1);
+        Serial.println(yAxis, 1);
     }
     else if (command == "US_CHECK") {
         ObstacleDirection obstacle = ultrasonics.checkObstacles();
@@ -285,6 +286,46 @@ void CommandHandler::processCommand(String command) {
     }
     else if (command == "BUZZER_WARNING") {
         buzzer.playWarning();
+        sendDone();
+    }
+    
+    // ==================== GPIO CONFIG COMMANDS ====================
+    else if (command == "GPIO_GET") {
+        // ส่งค่า config ปัจจุบันเป็น JSON
+        Serial.print("GPIO:");
+        Serial.println(gpioConfig.toJson());
+    }
+    else if (command == "GPIO_SWAP_MOTOR_YZ") {
+        // สลับ Motor Y กับ Motor Z
+        gpioConfig.swapMotorY();
+        gpioConfig.saveToEEPROM();
+        Serial.println("GPIO:SWAPPED_YZ");
+        sendDone();
+    }
+    else if (command == "GPIO_SWAP_WHEELS") {
+        // สลับ Wheel Left กับ Right
+        gpioConfig.swapWheels();
+        gpioConfig.saveToEEPROM();
+        Serial.println("GPIO:SWAPPED_WHEELS");
+        sendDone();
+    }
+    else if (command == "GPIO_RESET") {
+        // Reset เป็นค่าเริ่มต้น
+        gpioConfig.resetToDefault();
+        gpioConfig.saveToEEPROM();
+        Serial.println("GPIO:RESET_OK");
+        sendDone();
+    }
+    else if (command == "GPIO_SAVE") {
+        // บันทึกค่าปัจจุบันลง EEPROM
+        gpioConfig.saveToEEPROM();
+        Serial.println("GPIO:SAVED");
+        sendDone();
+    }
+    else if (command == "GPIO_RELOAD") {
+        // โหลดค่าจาก EEPROM ใหม่
+        gpioConfig.loadFromEEPROM();
+        Serial.println("GPIO:RELOADED");
         sendDone();
     }
     else {

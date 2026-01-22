@@ -18,6 +18,8 @@
 10. [Calibration System](#10-calibration-system)
 11. [Web Dashboard Architecture](#11-web-dashboard-architecture)
 12. [Error Handling](#12-error-handling)
+13. [Kinematics System](#13-kinematics-system) ⭐ NEW
+14. [Settings Parameters](#14-settings-parameters) ⭐ NEW
 
 ---
 
@@ -1002,7 +1004,7 @@ AgriBot ทำงานโดย:
 1. **กล้องจับภาพ** → ส่งให้ YOLO11
 2. **YOLO11 ตรวจจับ** → หาหญ้า + พริก
 3. **Tracker ติดตาม** → กำหนด ID, เก็บประวัติ
-4. **Brain คำนวณ** → แปลง pixel → cm
+4. **Brain คำนวณ** → แปลง pixel → cm (ใช้ Camera Calibration + IK)
 5. **ส่งคำสั่ง** → ESP32 ทำงานตามลำดับ
 6. **ESP32 ควบคุม** → Motor, Servo, Pump
 7. **Mark Sprayed** → บันทึก ID ที่พ่นแล้ว
@@ -1013,9 +1015,139 @@ AgriBot ทำงานโดย:
 - ✅ Physical Buttons (Start + Emergency Stop)
 - ✅ LCD Status Display
 - ✅ Web Dashboard Control
+- ✅ Camera Calibration (pixel → world cm)
+- ✅ Inverse Kinematics Engine
+- ✅ PID + Time-Based Motor Control
+- ✅ Advanced Settings (45+ parameters)
 
 ---
 
 **เขียนโดย:** AgriBot Team
-**Version:** 2.3.0
-**อัพเดท:** 2026-01-15
+**Version:** 3.0.0
+**อัพเดท:** 2026-01-21
+
+---
+
+## 13. Kinematics System
+
+### 13.1 Overview
+
+ระบบ Kinematics ใหม่ใช้ **Camera Calibration** และ **Inverse Kinematics** เพื่อคำนวณตำแหน่งแขนกลอย่างแม่นยำ
+
+```
+pixel (x, y)  →  Camera Calibration  →  world (x_cm, y_cm, z_cm)  →  Inverse Kinematics  →  joint angles/times
+```
+
+### 13.2 Modules
+
+| File | หน้าที่ |
+|------|--------|
+| `kinematics/camera_calibration.py` | แปลง pixel → world cm |
+| `kinematics/inverse_kinematics.py` | คำนวณมุม/ระยะข้อต่อ |
+| `control/pid_controller.py` | PID + Improved time-based |
+| `control/arm_controller.py` | รวม Camera + IK + Motor |
+
+### 13.3 Camera Calibration
+
+```python
+from kinematics.camera_calibration import quick_calibration
+
+calib = quick_calibration(
+    camera_height_cm=50.0,
+    camera_angle_deg=45.0
+)
+
+# แปลง pixel → world
+x_cm, y_cm, z_cm = calib.pixel_to_world(x_px=400, y_px=300)
+```
+
+### 13.4 Inverse Kinematics
+
+```python
+from kinematics.inverse_kinematics import create_agribot_ik
+
+ik = create_agribot_ik()
+solution = ik.solve(x=10.0, y=0.0, z=0.0)
+
+print(solution.joint_values)  # {'Z': 1.0, 'Y': 0.0}
+print(solution.joint_times)   # {'Z': 0.45, 'Y': 0.0}
+print(solution.reachable)     # True
+```
+
+### 13.5 Arm Controller
+
+```python
+from control.arm_controller import ArmController
+
+controller = ArmController(serial_connection, use_encoder=False)
+
+# เคลื่อนที่ไปยังตำแหน่งที่กล้องเห็น
+controller.move_to_pixel(x_px=400, y_px=300)
+
+# Execute spray mission
+controller.execute_spray_mission(x_px=400, y_px=300, spray_duration=2.0)
+```
+
+---
+
+## 14. Settings Parameters
+
+### 14.1 Overview
+
+ระบบ Settings ใหม่มี **45+ parameters** แบ่งเป็น 5 หมวดหลัก:
+
+| Tab | Parameters |
+|-----|------------|
+| **📏 พื้นฐาน** | Arm Z/Y lengths, speed, offset |
+| **⚡ การเคลื่อนที่** | Speed %, acceleration, tolerance |
+| **📷 กล้อง** | Height, angle, FOV, workspace bounds |
+| **🛡️ ความปลอดภัย** | Emergency stop, timeout, error handling |
+| **🔧 ขั้นสูง** | PID (Kp, Ki, Kd), Kalman filter, control method |
+
+### 14.2 Key Parameters
+
+```json
+{
+  "arm_speed_cm_per_sec": 2.21,
+  "arm_base_offset_cm": 9.0,
+  "max_arm_extend_cm": 15.5,
+  
+  "camera_height_cm": 50.0,
+  "camera_angle_deg": 45.0,
+  "pixel_to_cm_ratio": 0.034,
+  
+  "pid_kp": 2.0,
+  "pid_ki": 0.1,
+  "pid_kd": 0.05,
+  
+  "timeout_seconds": 30,
+  "emergency_stop_enabled": true
+}
+```
+
+### 14.3 API Endpoints
+
+```
+GET  /api/settings     → ดึงค่าทั้งหมด (45 keys)
+POST /api/settings     → บันทึกลง calibration.json
+```
+
+### 14.4 WebApp Settings UI
+
+หน้า Settings ใน WebApp มี 5 tabs:
+
+```
+┌─────────────────────────────────────────────────┐
+│  🛠️ ตั้งค่าแขนกล                              │
+├─────────────────────────────────────────────────┤
+│  [📏 พื้นฐาน] [⚡ Motion] [📷 Camera] [🛡️ Safety] [🔧 Adv] │
+│                                                 │
+│  Arm Z Length:    [15.5] cm                     │
+│  Arm Speed:       [2.21] cm/s                   │
+│  Camera Offset:   [9.0] cm                      │
+│                                                 │
+│  [🔘 บันทึก]  [↺ รีเซ็ต]                       │
+└─────────────────────────────────────────────────┘
+```
+
+---
