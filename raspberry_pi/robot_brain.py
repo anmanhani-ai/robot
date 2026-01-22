@@ -406,7 +406,9 @@ class RobotBrain:
         distance_cm = abs(offset_px) * self.config.pixel_to_cm_x
         time_seconds = distance_cm / self.config.wheel_speed_cm_per_sec
         
+        # Debug: แสดงค่า config ที่ใช้จริง
         logger.info(f"📏 Align to Y-axis: {target_x}px - {center_x}px = {offset_px}px")
+        logger.info(f"   CONFIG: pixel_to_cm_x={self.config.pixel_to_cm_x}, wheel_speed={self.config.wheel_speed_cm_per_sec}")
         logger.info(f"   → {direction} {distance_cm:.1f}cm = {time_seconds:.2f}s")
         
         return direction, time_seconds
@@ -502,13 +504,19 @@ class RobotBrain:
         retract_time = time_seconds + self.config.arm_retract_buffer
         return self.send_cmd(f"ACT:Z_IN:{retract_time:.2f}")
     
-    def lower_spray_head(self) -> bool:
+    def lower_spray_head(self, time_seconds: float = None) -> bool:
         """หัวฉีดลง Y-Axis"""
-        return self.send_cmd("ACT:Y_DOWN")
+        if time_seconds is None:
+            # คำนวณเวลาจาก config: motor_y_max_cm / motor_y_speed_cm_per_sec
+            time_seconds = self.config.motor_y_max_cm / self.config.motor_y_speed_cm_per_sec
+        return self.send_cmd(f"Y_DOWN:{time_seconds:.2f}")
     
-    def raise_spray_head(self) -> bool:
+    def raise_spray_head(self, time_seconds: float = None) -> bool:
         """หัวฉีดขึ้น Y-Axis"""
-        return self.send_cmd("ACT:Y_UP")
+        if time_seconds is None:
+            # คำนวณเวลาจาก config: motor_y_max_cm / motor_y_speed_cm_per_sec
+            time_seconds = self.config.motor_y_max_cm / self.config.motor_y_speed_cm_per_sec
+        return self.send_cmd(f"Y_UP:{time_seconds:.2f}")
     
     def spray(self, duration: Optional[float] = None) -> bool:
         """พ่นยา"""
